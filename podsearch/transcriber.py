@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 import subprocess
@@ -136,20 +137,23 @@ def transcribe_episode(
 def _download_audio(config: Config, url: str, output_path: pathlib.Path) -> None:
     max_bytes = config.transcription.max_audio_mb * 1024 * 1024
     request = urllib.request.Request(url, headers={"User-Agent": config.app.user_agent})
+    partial_path = output_path.with_name(f".{output_path.name}.part")
+    partial_path.unlink(missing_ok=True)
     try:
         with urllib.request.urlopen(request, timeout=180) as response:
             length = response.headers.get("Content-Length")
             if length and int(length) > max_bytes:
                 raise TranscriptionError(f"audio is larger than max_audio_mb: {length} bytes")
             written = 0
-            with output_path.open("wb") as output:
+            with partial_path.open("wb") as output:
                 while chunk := response.read(1024 * 1024):
                     written += len(chunk)
                     if written > max_bytes:
                         raise TranscriptionError("audio exceeded max_audio_mb while downloading")
                     output.write(chunk)
+        os.replace(partial_path, output_path)
     except Exception:
-        output_path.unlink(missing_ok=True)
+        partial_path.unlink(missing_ok=True)
         raise
 
 

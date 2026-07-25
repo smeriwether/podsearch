@@ -115,6 +115,10 @@ Four LaunchAgents are installed:
 An optional fifth LaunchAgent, `com.merimeri.podsearch.remote-pull`, pulls
 completed transcript bundles from a second Mac every five minutes.
 
+The Mac mini can also run `com.merimeri.podsearch.secondary-backfill`. It
+leases one old episode at a time to a second local Metal process, preventing
+overlap with the primary ranked worker.
+
 The nightly job always refreshes the catalog, ingests a three-day overlap
 window, saves newly discovered episodes, and atomically rebuilds the public
 database. While the historical backfill is running, the nightly job leaves
@@ -122,6 +126,22 @@ transcription to that worker. After the backfill finishes, nightly runs resume
 transcribing newly discovered episodes normally.
 
 Logs are stored in `var/logs/`.
+
+### Optional second Mac mini worker
+
+Install and start the concurrency-safe second local worker with:
+
+```bash
+python3 -m podsearch --config config.toml secondary-backfill-install
+launchctl bootout \
+  "gui/$(id -u)/com.merimeri.podsearch.secondary-backfill" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.merimeri.podsearch.secondary-backfill.plist"
+```
+
+Its logs are `var/logs/secondary-backfill.out.log` and
+`var/logs/secondary-backfill.err.log`. It pauses before starting another
+episode if system memory headroom falls below 25%.
 
 ## Distributed backfill with a second Mac
 

@@ -107,6 +107,11 @@ def main(argv: list[str] | None = None) -> int:
     remote_pull_parser.add_argument("--remote-repo", required=True)
     remote_pull_parser.add_argument("--interval", type=int, default=300)
 
+    commands.add_parser(
+        "secondary-backfill-install",
+        help="Install a second concurrency-safe local Metal backfill worker",
+    )
+
     args = parser.parse_args(argv)
     config = load_config(args.config)
 
@@ -135,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
             interval_seconds=args.interval,
         )
         print(f"remote_pull_plist={path}")
+        return 0
+    if args.command == "secondary-backfill-install":
+        path = launchd.install_secondary_backfill(config)
+        print(f"secondary_backfill_plist={path}")
         return 0
 
     with storage.connect(config) as conn:

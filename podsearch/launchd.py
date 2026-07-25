@@ -11,6 +11,7 @@ SERVER_LABEL = "com.merimeri.podsearch.server"
 TUNNEL_LABEL = "com.merimeri.podsearch.tunnel"
 BACKFILL_LABEL = "com.merimeri.podsearch.backfill"
 REMOTE_PULL_LABEL = "com.merimeri.podsearch.remote-pull"
+SECONDARY_BACKFILL_LABEL = "com.merimeri.podsearch.secondary-backfill"
 
 
 def install(
@@ -165,6 +166,48 @@ def install_remote_pull(
         "StandardErrorPath": str(log_dir / "remote-pull.err.log"),
     }
     path = launch_agents / f"{REMOTE_PULL_LABEL}.plist"
+    with path.open("wb") as output:
+        plistlib.dump(payload, output, sort_keys=False)
+    return path
+
+
+def install_secondary_backfill(config: Config) -> pathlib.Path:
+    home = pathlib.Path.home()
+    launch_agents = home / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    log_dir = config.app.state_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    runtime_path = ":".join(
+        (
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+            str(home / ".local" / "share" / "mise" / "shims"),
+            str(home / ".local" / "bin"),
+        )
+    )
+    payload = {
+        "Label": SECONDARY_BACKFILL_LABEL,
+        "ProgramArguments": [
+            "/bin/zsh",
+            str(config.root / "scripts" / "local-secondary-backfill.sh"),
+        ],
+        "WorkingDirectory": str(config.root),
+        "EnvironmentVariables": {
+            "PATH": runtime_path,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 60,
+        "ProcessType": "Background",
+        "StandardOutPath": str(log_dir / "secondary-backfill.out.log"),
+        "StandardErrorPath": str(log_dir / "secondary-backfill.err.log"),
+    }
+    path = launch_agents / f"{SECONDARY_BACKFILL_LABEL}.plist"
     with path.open("wb") as output:
         plistlib.dump(payload, output, sort_keys=False)
     return path

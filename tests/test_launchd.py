@@ -67,6 +67,32 @@ state_dir = "var"
                     interval_seconds=30,
                 )
 
+    def test_install_secondary_backfill_writes_restartable_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            home = root / "home"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+[app]
+state_dir = "var"
+""",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            with mock.patch("pathlib.Path.home", return_value=home):
+                path = launchd.install_secondary_backfill(config)
+
+            with path.open("rb") as source:
+                payload = plistlib.load(source)
+            self.assertEqual(payload["Label"], launchd.SECONDARY_BACKFILL_LABEL)
+            self.assertTrue(payload["RunAtLoad"])
+            self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+            self.assertIn(
+                "local-secondary-backfill.sh",
+                payload["ProgramArguments"][1],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
