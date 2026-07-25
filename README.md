@@ -10,7 +10,7 @@ The public site downloads the small compressed catalog first and opens it with
 SQLite Wasm in a Web Worker. Transcript searches open one monthly shard at a
 time and close it before opening the next; episode pages fetch only the month
 containing that transcript. Search queries and full-transcript reads stay in
-the visitor's browser, and downloaded databases are cached for 12 hours. The
+the visitor's browser, and downloaded databases are cached for 6 hours. The
 Mac mini serves only static files.
 
 Live site: <https://podsearch.merimerimeri.com>

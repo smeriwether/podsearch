@@ -95,5 +95,8 @@ for (const marker of [
 if (worker.includes('"/data/podsearch.sqlite3"')) {
   throw new Error("db-worker.js should not load the legacy monolithic database");
 }
+if (!worker.includes("const DATABASE_CACHE_TTL_MS = 6 * 60 * 60 * 1000")) {
+  throw new Error("db-worker.js should cache databases for six hours");
+}
 
 console.log("site verification passed");

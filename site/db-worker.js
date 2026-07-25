@@ -2,7 +2,7 @@ import sqlite3InitModule from "/vendor/sqlite/index.mjs";
 
 const CATALOG_URL = "/data/catalog.sqlite3";
 const DATABASE_CACHE = "podsearch-database-v9";
-const DATABASE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const DATABASE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 let sqlite3;
 let catalogDb;

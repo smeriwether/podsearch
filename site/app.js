@@ -13,7 +13,7 @@ const state = {
 renderInitialRoute();
 document.addEventListener("keydown", focusSearch);
 
-const worker = new Worker("/db-worker.js?v=20260725y", { type: "module" });
+const worker = new Worker("/db-worker.js?v=20260725z", { type: "module" });
 worker.onmessage = ({ data }) => {
   if (data.type === "progress") return;
   if (["search-progress", "episode-progress"].includes(data.type)) {
