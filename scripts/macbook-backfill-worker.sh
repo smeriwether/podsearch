@@ -12,8 +12,8 @@ WORKER_ID=$(print -r -- "$WORKER_ID" | tr -cd 'A-Za-z0-9._-')
 CLAIM_LIMIT=${PODSEARCH_WORKER_CLAIM_LIMIT:-200}
 LEASE_HOURS=${PODSEARCH_WORKER_LEASE_HOURS:-72}
 WHISPER_MODEL=${PODSEARCH_WHISPER_MODEL:-$HOME/.cache/whisper.cpp/ggml-large-v3-turbo-q5_0.bin}
-LOCAL_DATABASE="$PWD/var/remote-worker.sqlite3"
-INCOMING_DATABASE="$PWD/var/.remote-worker.sqlite3.incoming"
+LOCAL_DATABASE="$PWD/var/remote-worker-$WORKER_ID.sqlite3"
+INCOMING_DATABASE="$PWD/var/.remote-worker-$WORKER_ID.sqlite3.incoming"
 OUTBOX="$PWD/var/worker-outbox"
 REMOTE_SNAPSHOT="$MINI_REPO/var/worker-exports/$WORKER_ID.sqlite3"
 

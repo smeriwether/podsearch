@@ -234,6 +234,10 @@ export PODSEARCH_MINI_REPO=/Users/merimerimeri/Development/podsearch
 export PODSEARCH_WORKER_ID=my-m4-macbook-pro
 ```
 
+Multiple workers can run on the same MacBook by assigning each one a distinct
+`PODSEARCH_WORKER_ID`. Each worker receives its own leased snapshot database,
+while completed bundles safely share the same outbox.
+
 The mini continues prioritizing the latest untranscribed episodes from the
 front of the ranked queue while the MacBook works from the oldest leased
 episodes at the back.
