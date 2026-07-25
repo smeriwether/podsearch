@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import gzip
 import hashlib
 import os
@@ -18,6 +19,18 @@ LEGACY_DATABASE_NAMES = ("podsearch.sqlite3", "podsearch.sqlite3.gz")
 
 
 def build_site(config: Config, conn: sqlite3.Connection) -> dict[str, int]:
+    run_dir = config.app.state_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir / "site-build.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return _build_site_unlocked(config, conn)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _build_site_unlocked(config: Config, conn: sqlite3.Connection) -> dict[str, int]:
     public_dir = config.app.public_dir
     data_dir = public_dir / "data"
     vendor_dir = public_dir / "vendor" / "sqlite"

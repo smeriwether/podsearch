@@ -95,6 +95,65 @@ class RankedBackfillQueueTests(unittest.TestCase):
         )
         self.assertEqual(wrapped_rank_one[0]["queue_cursor_rank"], 3)
 
+    def test_remote_worker_claims_oldest_and_primary_queue_skips_leases(self) -> None:
+        claimed = storage.claim_remote_backfill(
+            self.conn,
+            worker_id="macbook-pro",
+            limit=2,
+            lease_hours=72,
+            published_since="2026-01-01",
+        )
+        claimed_guids = [
+            row["guid"]
+            for row in self.conn.execute(
+                "SELECT guid FROM episodes WHERE id IN (?, ?) ORDER BY id",
+                claimed,
+            )
+        ]
+        self.assertEqual(claimed_guids, ["r1-1", "r2-1"])
+        self.assertEqual(
+            [
+                row["guid"]
+                for row in storage.episodes_for_remote_worker(
+                    self.conn,
+                    worker_id="macbook-pro",
+                    limit=10,
+                    retry_failed=True,
+                )
+            ],
+            ["r1-1", "r2-1"],
+        )
+
+        latest_rank_one = self.conn.execute(
+            "SELECT id FROM episodes WHERE guid = 'r1-3'"
+        ).fetchone()["id"]
+        timestamp = storage.now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO transcription_claims (
+              episode_id, worker_id, claimed_at, expires_at
+            )
+            VALUES (?, 'other-worker', ?, '2099-01-01T00:00:00+00:00')
+            """,
+            (latest_rank_one, timestamp),
+        )
+        primary = self._next()
+        self.assertEqual([row["guid"] for row in primary], ["r1-2"])
+
+        self.conn.execute(
+            """
+            UPDATE transcription_claims
+            SET expires_at = '2000-01-01T00:00:00+00:00'
+            WHERE episode_id = ?
+            """,
+            (latest_rank_one,),
+        )
+        primary_after_expiry = self._next()
+        self.assertEqual(
+            [row["guid"] for row in primary_after_expiry],
+            ["r1-3", "r1-2"],
+        )
+
 
 class CatalogOrderingTests(unittest.TestCase):
     def setUp(self) -> None:

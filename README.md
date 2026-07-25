@@ -112,6 +112,9 @@ Four LaunchAgents are installed:
 - `com.merimeri.podsearch.backfill`: resumes the 2026 backfill at login and
   stops permanently once the queue is complete.
 
+An optional fifth LaunchAgent, `com.merimeri.podsearch.remote-pull`, pulls
+completed transcript bundles from a second Mac every five minutes.
+
 The nightly job always refreshes the catalog, ingests a three-day overlap
 window, saves newly discovered episodes, and atomically rebuilds the public
 database. While the historical backfill is running, the nightly job leaves
@@ -119,6 +122,101 @@ transcription to that worker. After the backfill finishes, nightly runs resume
 transcribing newly discovered episodes normally.
 
 Logs are stored in `var/logs/`.
+
+## Distributed backfill with a second Mac
+
+The Mac mini remains the primary database owner. A remote worker never copies
+its SQLite database back to the mini and never writes across the network.
+Instead:
+
+1. The MacBook asks the mini for a lean worker snapshot.
+2. The mini leases the oldest 200 eligible episodes to that worker for 72
+   hours. Its own newest-first ranked queue skips active leases.
+3. The MacBook transcribes those leased episodes oldest-first using
+   `large-v3-turbo-q5_0` on Metal.
+4. Each completion becomes a checksummed JSON bundle in
+   `var/worker-outbox/`.
+5. The mini pulls bundles over SSH/rsync, imports only transcripts it still
+   lacks, clears their leases, and rebuilds the static site.
+
+Expired leases automatically return to the mini queue. Bundle imports are
+idempotent, so even a race or retry cannot corrupt the primary database.
+
+### 1. Prepare SSH over Tailscale
+
+Both Macs need non-interactive SSH access to each other. Test both directions:
+
+```bash
+# From the MacBook Pro
+ssh mac-mini.your-tailnet.ts.net true
+
+# From the Mac mini
+ssh macbook-pro.your-tailnet.ts.net true
+```
+
+Use macOS Remote Login or Tailscale SSH. The scripts use `BatchMode=yes`, so
+password prompts will intentionally fail rather than hanging a background job.
+
+### 2. Install the Mac mini pull job
+
+On the Mac mini, pull the latest repository and install the optional
+LaunchAgent:
+
+```bash
+cd /Users/merimerimeri/Development/podsearch
+git pull
+
+python3 -m podsearch --config config.toml remote-pull-install \
+  --worker macbook-pro.your-tailnet.ts.net \
+  --remote-repo /Users/merimerimeri/Development/podsearch \
+  --interval 300
+
+launchctl bootout "gui/$(id -u)/com.merimeri.podsearch.remote-pull" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.merimeri.podsearch.remote-pull.plist"
+launchctl kickstart -k "gui/$(id -u)/com.merimeri.podsearch.remote-pull"
+```
+
+The pull log is `var/logs/remote-pull.out.log`; SSH or import failures are in
+`var/logs/remote-pull.err.log`.
+
+### 3. Start the MacBook worker
+
+On the MacBook Pro:
+
+```bash
+git clone https://github.com/smeriwether/podsearch.git
+cd podsearch
+
+brew install whisper-cpp
+mkdir -p "$HOME/.cache/whisper.cpp"
+scp mac-mini.your-tailnet.ts.net:.cache/whisper.cpp/ggml-large-v3-turbo-q5_0.bin \
+  "$HOME/.cache/whisper.cpp/"
+
+export PODSEARCH_MINI_HOST=mac-mini.your-tailnet.ts.net
+scripts/macbook-backfill-worker.sh
+```
+
+The script verifies `whisper-cli` and the model before claiming work. It
+downloads only a small leased queue database, not the mini's transcript
+database. It attempts every episode in the current lease once, emits Whisper's
+Metal/device output while it runs, and continues past a bad download or
+transcription. Once the mini has emptied the MacBook outbox, rerun it to claim
+the next oldest block.
+
+Optional worker settings:
+
+```bash
+export PODSEARCH_WORKER_CLAIM_LIMIT=200
+export PODSEARCH_WORKER_LEASE_HOURS=72
+export PODSEARCH_WHISPER_MODEL="$HOME/.cache/whisper.cpp/ggml-large-v3-turbo-q5_0.bin"
+export PODSEARCH_MINI_REPO=/Users/merimerimeri/Development/podsearch
+export PODSEARCH_WORKER_ID=my-m4-macbook-pro
+```
+
+The mini continues prioritizing the latest untranscribed episodes from the
+front of the ranked queue while the MacBook works from the oldest leased
+episodes at the back.
 
 ## Cloudflare
 

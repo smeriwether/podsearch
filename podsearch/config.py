@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import json
+import os
 import pathlib
 from typing import Any
 
@@ -86,18 +87,31 @@ def load_config(path: str | pathlib.Path) -> Config:
     root = config_path.parent
     app = _dataclass_from_dict(AppConfig, raw.get("app", {}))
     transcription = _dataclass_from_dict(TranscriptionConfig, raw.get("transcription", {}))
+    database_override = os.environ.get("PODSEARCH_DATABASE_PATH")
+    transcription_args = list(transcription.args)
+    model_override = os.environ.get("PODSEARCH_WHISPER_MODEL")
+    if model_override:
+        for index, arg in enumerate(transcription_args[:-1]):
+            if arg in {"-m", "--model"}:
+                transcription_args[index + 1] = str(
+                    pathlib.Path(model_override).expanduser()
+                )
+                break
     return Config(
         root=root,
         app=dataclasses.replace(
             app,
-            database_path=_resolve(root, app.database_path),
+            database_path=_resolve(
+                root,
+                database_override if database_override else app.database_path,
+            ),
             public_dir=_resolve(root, app.public_dir),
             state_dir=_resolve(root, app.state_dir),
         ),
         chart=_dataclass_from_dict(ChartConfig, raw.get("chart", {})),
         transcription=dataclasses.replace(
             transcription,
-            args=tuple(transcription.args),
+            args=tuple(transcription_args),
             audio_dir=_resolve(root, transcription.audio_dir),
             transcript_dir=_resolve(root, transcription.transcript_dir),
         ),

@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import sys
 
-from . import apple, feeds, launchd, site, storage, transcriber
+from . import apple, distributed, feeds, launchd, site, storage, transcriber
 from .config import Config, load_config
 from .server import serve
 
@@ -73,6 +73,40 @@ def main(argv: list[str] | None = None) -> int:
     launchd_parser.add_argument("--hour", type=int, default=2)
     launchd_parser.add_argument("--minute", type=int, default=30)
 
+    snapshot_parser = commands.add_parser(
+        "export-worker-snapshot",
+        help="Claim oldest episodes and export a lean remote-worker database",
+    )
+    snapshot_parser.add_argument("--output", required=True)
+    snapshot_parser.add_argument("--worker-id", required=True)
+    snapshot_parser.add_argument("--claim-limit", type=int, default=200)
+    snapshot_parser.add_argument("--lease-hours", type=int, default=72)
+    snapshot_parser.add_argument("--since", default="2026-01-01")
+
+    worker_parser = commands.add_parser(
+        "worker-transcribe",
+        help="Transcribe leased remote-worker episodes and write result bundles",
+    )
+    worker_parser.add_argument("--worker-id", required=True)
+    worker_parser.add_argument("--outbox", default="var/worker-outbox")
+    worker_parser.add_argument("--limit", type=int, default=1)
+    worker_parser.add_argument("--retry-failed", action="store_true")
+    worker_parser.add_argument("--quiet-command", action="store_true")
+
+    import_parser = commands.add_parser(
+        "import-transcript-results",
+        help="Import idempotent transcript result bundles into the primary database",
+    )
+    import_parser.add_argument("inbox", nargs="?", default="var/worker-inbox")
+
+    remote_pull_parser = commands.add_parser(
+        "remote-pull-install",
+        help="Install the Mac mini LaunchAgent that pulls remote transcript bundles",
+    )
+    remote_pull_parser.add_argument("--worker", required=True, help="SSH host, e.g. user@macbook")
+    remote_pull_parser.add_argument("--remote-repo", required=True)
+    remote_pull_parser.add_argument("--interval", type=int, default=300)
+
     args = parser.parse_args(argv)
     config = load_config(args.config)
 
@@ -92,6 +126,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"server_plist={server}")
         print(f"tunnel_plist={tunnel}")
         print(f"backfill_plist={backfill}")
+        return 0
+    if args.command == "remote-pull-install":
+        path = launchd.install_remote_pull(
+            config,
+            worker=args.worker,
+            remote_repo=args.remote_repo,
+            interval_seconds=args.interval,
+        )
+        print(f"remote_pull_plist={path}")
         return 0
 
     with storage.connect(config) as conn:
@@ -122,6 +165,37 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "build-site":
             _print_stats(site.build_site(config, conn))
+        elif args.command == "export-worker-snapshot":
+            _print_stats(
+                distributed.export_worker_snapshot(
+                    conn,
+                    pathlib.Path(args.output),
+                    worker_id=args.worker_id,
+                    claim_limit=args.claim_limit,
+                    lease_hours=args.lease_hours,
+                    published_since=args.since,
+                )
+            )
+        elif args.command == "worker-transcribe":
+            _print_stats(
+                distributed.process_worker_batch(
+                    config,
+                    conn,
+                    worker_id=args.worker_id,
+                    outbox=pathlib.Path(args.outbox),
+                    limit=args.limit,
+                    retry_failed=args.retry_failed,
+                    command_output=not args.quiet_command,
+                )
+            )
+        elif args.command == "import-transcript-results":
+            _print_stats(
+                distributed.import_result_bundles(
+                    config,
+                    conn,
+                    pathlib.Path(args.inbox),
+                )
+            )
         elif args.command == "run-nightly":
             _print_stats(run_nightly(config, conn, metadata_only=args.metadata_only))
         elif args.command == "list":

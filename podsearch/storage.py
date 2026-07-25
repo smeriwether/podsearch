@@ -92,6 +92,16 @@ def migrate(conn: sqlite3.Connection) -> None:
           value TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS transcription_claims (
+          episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+          worker_id TEXT NOT NULL,
+          claimed_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transcription_claims_worker
+          ON transcription_claims(worker_id, expires_at);
         """
     )
     _ensure_column(conn, "shows", "description", "TEXT")
@@ -391,6 +401,15 @@ def episodes_for_transcription(
         sql += f" AND episodes.status IN ({placeholders})"
         params.extend(statuses)
         sql += " AND shows.active = 1 AND (shows.in_top_100 = 1 OR shows.favorite = 1)"
+        sql += """
+            AND NOT EXISTS (
+              SELECT 1
+              FROM transcription_claims
+              WHERE transcription_claims.episode_id = episodes.id
+                AND transcription_claims.expires_at > ?
+            )
+        """
+        params.append(now_iso())
     if ids:
         id_placeholders = ",".join("?" for _ in ids)
         sql += f" AND episodes.id IN ({id_placeholders})"
@@ -419,6 +438,7 @@ def _episodes_for_ranked_backfill(
     status_placeholders = ",".join("?" for _ in statuses)
     date_sql = ""
     date_params: list[Any] = []
+    claim_timestamp = now_iso()
     if published_since:
         date_sql = " AND (candidate.published_at IS NULL OR candidate.published_at >= ?)"
         date_params.append(published_since)
@@ -437,13 +457,19 @@ def _episodes_for_ranked_backfill(
               AND candidate.audio_url IS NOT NULL
               AND candidate.status IN ({status_placeholders})
               {date_sql}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM transcription_claims
+                WHERE transcription_claims.episode_id = candidate.id
+                  AND transcription_claims.expires_at > ?
+              )
           )
         ORDER BY
           CASE WHEN shows.chart_rank >= ? THEN 0 ELSE 1 END,
           shows.chart_rank
         LIMIT 1
         """,
-        [*statuses, *date_params, cursor],
+        [*statuses, *date_params, claim_timestamp, cursor],
     ).fetchone()
     if show is None:
         return []
@@ -471,6 +497,12 @@ def _episodes_for_ranked_backfill(
               AND episodes.audio_url IS NOT NULL
               AND episodes.status IN ({status_placeholders})
               {episode_date_sql}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM transcription_claims
+                WHERE transcription_claims.episode_id = episodes.id
+                  AND transcription_claims.expires_at > ?
+              )
             ORDER BY
               COALESCE(episodes.published_at, episodes.created_at) DESC,
               episodes.id DESC
@@ -481,9 +513,153 @@ def _episodes_for_ranked_backfill(
                 int(show["id"]),
                 *statuses,
                 *episode_date_params,
+                claim_timestamp,
                 per_show,
             ],
         )
+    )
+
+
+def claim_remote_backfill(
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    limit: int,
+    lease_hours: int,
+    published_since: str | None,
+) -> list[int]:
+    if not worker_id.strip():
+        raise ValueError("worker_id is required")
+    if limit <= 0:
+        return []
+    if lease_hours <= 0:
+        raise ValueError("lease_hours must be positive")
+
+    timestamp = now_iso()
+    expires_at = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=lease_hours)
+    ).replace(microsecond=0).isoformat()
+    conn.execute("DELETE FROM transcription_claims WHERE expires_at <= ?", (timestamp,))
+    existing = [
+        int(row["episode_id"])
+        for row in conn.execute(
+            """
+            SELECT transcription_claims.episode_id
+            FROM transcription_claims
+            JOIN episodes ON episodes.id = transcription_claims.episode_id
+            WHERE transcription_claims.worker_id = ?
+              AND transcription_claims.expires_at > ?
+              AND episodes.status IN ('new', 'transcription_failed')
+            ORDER BY COALESCE(episodes.published_at, episodes.created_at) ASC,
+                     episodes.id ASC
+            """,
+            (worker_id, timestamp),
+        )
+    ]
+    needed = max(0, limit - len(existing))
+    params: list[Any] = [timestamp]
+    date_sql = ""
+    if published_since:
+        date_sql = " AND (episodes.published_at IS NULL OR episodes.published_at >= ?)"
+        params.append(published_since)
+    params.append(needed)
+    candidates = (
+        []
+        if needed == 0
+        else [
+            int(row["id"])
+            for row in conn.execute(
+                f"""
+                SELECT episodes.id
+                FROM episodes
+                JOIN shows ON shows.id = episodes.show_id
+                WHERE episodes.audio_url IS NOT NULL
+                  AND episodes.status IN ('new', 'transcription_failed')
+                  AND shows.active = 1
+                  AND (shows.in_top_100 = 1 OR shows.favorite = 1)
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM transcription_claims
+                    WHERE transcription_claims.episode_id = episodes.id
+                      AND transcription_claims.expires_at > ?
+                  )
+                  {date_sql}
+                ORDER BY COALESCE(episodes.published_at, episodes.created_at) ASC,
+                         episodes.id ASC
+                LIMIT ?
+                """,
+                params,
+            )
+        ]
+    )
+    for episode_id in candidates:
+        conn.execute(
+            """
+            INSERT INTO transcription_claims (
+              episode_id, worker_id, claimed_at, expires_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(episode_id) DO UPDATE SET
+              worker_id = excluded.worker_id,
+              claimed_at = excluded.claimed_at,
+              expires_at = excluded.expires_at
+            """,
+            (episode_id, worker_id, timestamp, expires_at),
+        )
+    conn.execute(
+        """
+        UPDATE transcription_claims
+        SET expires_at = ?
+        WHERE worker_id = ? AND expires_at > ?
+        """,
+        (expires_at, worker_id, timestamp),
+    )
+    conn.commit()
+    return existing + candidates
+
+
+def episodes_for_remote_worker(
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    limit: int | None,
+    retry_failed: bool,
+) -> list[sqlite3.Row]:
+    statuses = ("new", "transcription_failed") if retry_failed else ("new",)
+    placeholders = ",".join("?" for _ in statuses)
+    params: list[Any] = [worker_id, now_iso(), *statuses]
+    limit_sql = ""
+    if limit is not None:
+        limit_sql = " LIMIT ?"
+        params.append(limit)
+    return list(
+        conn.execute(
+            f"""
+            SELECT episodes.*, shows.name AS show_name,
+                   shows.apple_url AS show_apple_url
+            FROM transcription_claims
+            JOIN episodes ON episodes.id = transcription_claims.episode_id
+            JOIN shows ON shows.id = episodes.show_id
+            WHERE transcription_claims.worker_id = ?
+              AND transcription_claims.expires_at > ?
+              AND episodes.audio_url IS NOT NULL
+              AND episodes.status IN ({placeholders})
+            ORDER BY COALESCE(episodes.published_at, episodes.created_at) ASC,
+                     episodes.id ASC
+            {limit_sql}
+            """,
+            params,
+        )
+    )
+
+
+def release_transcription_claim(
+    conn: sqlite3.Connection,
+    episode_id: int,
+) -> None:
+    conn.execute(
+        "DELETE FROM transcription_claims WHERE episode_id = ?",
+        (episode_id,),
     )
 
 
