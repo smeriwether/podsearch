@@ -1,0 +1,14 @@
+[project]
+name = "podsearch"
+version = "0.1.0"
+description = "A local podcast transcription pipeline with a browser-searchable SQLite index."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+podsearch = "podsearch.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

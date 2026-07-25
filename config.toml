@@ -1,0 +1,54 @@
+# Add favorites as Apple Podcasts URLs or numeric Apple podcast IDs.
+# They remain indexed even when they are not in Apple's current Top 100.
+favorites = [
+  "1347973549", # Modern Wisdom
+  "1832119842", # Office Hours with Arthur Brooks
+  "1073226719", # Pivot
+  "1264193508", # REWORK
+  "1498802610", # The Prof G Pod with Scott Galloway
+  "528458508",  # The Talk Show With John Gruber
+  "1277873664", # First Things First
+  "1200361736", # The Daily
+  "1050462261", # Acquired
+  "1552556988", # A Modern Man
+  "1612694726", # What's Wright? with Nick Wright
+  "1043699613", # The Bill Simmons Podcast
+]
+
+[app]
+timezone = "America/New_York"
+database_path = "var/podsearch.sqlite3"
+public_dir = "public"
+state_dir = "var"
+user_agent = "podsearch/0.1 (podsearch.merimerimeri.com)"
+processed_after = "2026-01-01"
+nightly_lookback_days = 3
+nightly_transcription_limit = 100
+
+[chart]
+country = "us"
+limit = 100
+url = "https://rss.marketingtools.apple.com/api/v2/{country}/podcasts/top/{limit}/podcasts.json"
+extended_url = "https://itunes.apple.com/{country}/rss/toppodcasts/limit=200/json"
+
+[transcription]
+provider = "command"
+command = "whisper-cli"
+args = ["-m", "/Users/merimerimeri/.cache/whisper.cpp/ggml-large-v3-turbo-q5_0.bin", "-f", "{audio_path}", "-otxt", "-of", "{output_stem}", "-l", "en", "-dev", "0", "-np"]
+output_path = "{output_stem}.txt"
+audio_dir = "var/audio"
+transcript_dir = "var/transcripts"
+max_audio_mb = 750
+keep_audio = false
+
+[site]
+title = "Podsearch"
+description = "Search full podcast transcripts, right in your browser."
+base_url = "https://podsearch.merimerimeri.com"
+host = "127.0.0.1"
+port = 8091
+
+# Apple's lookup currently omits these two open feeds.
+[feed_overrides]
+"1047335260" = "https://feeds.megaphone.fm/BVDWV5370667266"
+"1489482036" = "https://feeds.simplecast.com/MTPwrbcY"

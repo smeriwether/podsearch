@@ -1,0 +1,14 @@
+{
+  "name": "podsearch-site",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "python3 -m podsearch --config config.toml build-site",
+    "test": "python3 -m unittest discover -s tests",
+    "verify:site": "node scripts/verify-site.mjs"
+  },
+  "dependencies": {
+    "@sqlite.org/sqlite-wasm": "3.53.0-build1"
+  }
+}
