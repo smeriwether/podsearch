@@ -51,7 +51,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Only transcribe this episode ID. Repeatable.",
     )
 
-    commands.add_parser("build-site", help="Build static assets and the public SQLite index")
+    build_site_parser = commands.add_parser(
+        "build-site", help="Build static assets and the public SQLite index"
+    )
+    build_site_parser.add_argument(
+        "--if-stale-seconds",
+        type=int,
+        default=0,
+        help=(
+            "Coalesce worker-triggered builds until the published site is this old. "
+            "A later worker or pull pass publishes deferred changes."
+        ),
+    )
     nightly = commands.add_parser(
         "run-nightly", help="Refresh, transcribe, and rebuild the static site"
     )
@@ -173,7 +184,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "build-site":
-            _print_stats(site.build_site(config, conn))
+            if args.if_stale_seconds < 0:
+                parser.error("--if-stale-seconds cannot be negative")
+            _print_stats(
+                site.build_site(
+                    config,
+                    conn,
+                    minimum_interval_seconds=args.if_stale_seconds,
+                )
+            )
         elif args.command == "export-worker-snapshot":
             _print_stats(
                 distributed.export_worker_snapshot(

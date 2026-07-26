@@ -7,8 +7,13 @@ export PYTHONDONTWRITEBYTECODE=1
 
 REMOTE_WORKER=${PODSEARCH_REMOTE_WORKER:?Set PODSEARCH_REMOTE_WORKER to the MacBook SSH host}
 REMOTE_REPO=${PODSEARCH_REMOTE_REPO:?Set PODSEARCH_REMOTE_REPO to the absolute MacBook repository path}
+SITE_BUILD_INTERVAL=${PODSEARCH_SITE_BUILD_INTERVAL_SECONDS:-900}
 if [[ "$REMOTE_REPO" != /* ]]; then
   echo "PODSEARCH_REMOTE_REPO must be an absolute path" >&2
+  exit 1
+fi
+if ! [[ "$SITE_BUILD_INTERVAL" == <-> && "$SITE_BUILD_INTERVAL" -gt 0 ]]; then
+  echo "PODSEARCH_SITE_BUILD_INTERVAL_SECONDS must be a positive integer" >&2
   exit 1
 fi
 if ! command -v rsync >/dev/null 2>&1; then
@@ -49,6 +54,7 @@ OUTPUT=$(python3 -m podsearch --config config.toml \
   import-transcript-results var/worker-inbox)
 print -r -- "$OUTPUT"
 IMPORTED=$(print -r -- "$OUTPUT" | awk -F= '$1 == "imported" {print $2}')
-if [ "${IMPORTED:-0}" -gt 0 ]; then
-  python3 -m podsearch --config config.toml build-site
+if [ "${IMPORTED:-0}" -gt 0 ] || [ -f var/run/site-build.pending ]; then
+  python3 -m podsearch --config config.toml build-site \
+    --if-stale-seconds "$SITE_BUILD_INTERVAL"
 fi

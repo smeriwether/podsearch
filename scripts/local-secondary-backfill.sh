@@ -9,6 +9,7 @@ WORKER_ID=${PODSEARCH_SECONDARY_WORKER_ID:-mac-mini-secondary}
 LEASE_HOURS=${PODSEARCH_SECONDARY_LEASE_HOURS:-24}
 RETRY_DELAY=${PODSEARCH_SECONDARY_RETRY_DELAY:-300}
 MIN_MEMORY_FREE_PERCENT=${PODSEARCH_SECONDARY_MIN_MEMORY_FREE_PERCENT:-25}
+SITE_BUILD_INTERVAL=${PODSEARCH_SITE_BUILD_INTERVAL_SECONDS:-900}
 DATABASE="$PWD/var/local-secondary.sqlite3"
 OUTBOX="$PWD/var/local-secondary-outbox"
 
@@ -22,6 +23,10 @@ if ! [[ "$RETRY_DELAY" == <-> && "$RETRY_DELAY" -gt 0 ]]; then
 fi
 if ! [[ "$MIN_MEMORY_FREE_PERCENT" == <-> && "$MIN_MEMORY_FREE_PERCENT" -gt 0 && "$MIN_MEMORY_FREE_PERCENT" -lt 100 ]]; then
   echo "PODSEARCH_SECONDARY_MIN_MEMORY_FREE_PERCENT must be between 1 and 99" >&2
+  exit 1
+fi
+if ! [[ "$SITE_BUILD_INTERVAL" == <-> && "$SITE_BUILD_INTERVAL" -gt 0 ]]; then
+  echo "PODSEARCH_SITE_BUILD_INTERVAL_SECONDS must be a positive integer" >&2
   exit 1
 fi
 
@@ -86,5 +91,8 @@ while true; do
 
   python3 -m podsearch --config config.toml \
     import-transcript-results "$OUTBOX"
-  python3 -m podsearch --config config.toml build-site
+  python3 -m podsearch --config config.toml build-site \
+    --if-stale-seconds "$SITE_BUILD_INTERVAL"
 done
+
+python3 -m podsearch --config config.toml build-site

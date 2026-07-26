@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import pathlib
 import sqlite3
@@ -68,6 +69,7 @@ def migrate(conn: sqlite3.Connection) -> None:
           error_message TEXT,
           transcript_path TEXT,
           transcript_text TEXT,
+          transcript_sha256 TEXT,
           transcribed_at TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
@@ -110,6 +112,29 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "shows", "ever_top_100", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "shows", "apple_rank", "INTEGER")
     _ensure_column(conn, "shows", "favorite_order", "INTEGER")
+    _ensure_column(conn, "episodes", "transcript_sha256", "TEXT")
+    missing_hashes = conn.execute(
+        """
+        SELECT id, transcript_text
+        FROM episodes
+        WHERE transcript_text IS NOT NULL
+          AND transcript_text != ''
+          AND (transcript_sha256 IS NULL OR transcript_sha256 = '')
+        """
+    )
+    while batch := missing_hashes.fetchmany(25):
+        conn.executemany(
+            "UPDATE episodes SET transcript_sha256 = ? WHERE id = ?",
+            [
+                (
+                    hashlib.sha256(
+                        str(row["transcript_text"]).encode("utf-8")
+                    ).hexdigest(),
+                    int(row["id"]),
+                )
+                for row in batch
+            ],
+        )
     conn.execute(
         """
         UPDATE shows
@@ -706,10 +731,18 @@ def set_transcript(
         """
         UPDATE episodes
         SET status = 'transcribed', transcript_text = ?, transcript_path = ?,
-            transcribed_at = ?, error_message = NULL, updated_at = ?
+            transcript_sha256 = ?, transcribed_at = ?,
+            error_message = NULL, updated_at = ?
         WHERE id = ?
         """,
-        (transcript, str(path), timestamp, timestamp, episode_id),
+        (
+            transcript,
+            str(path),
+            hashlib.sha256(transcript.encode("utf-8")).hexdigest(),
+            timestamp,
+            timestamp,
+            episode_id,
+        ),
     )
 
 

@@ -67,29 +67,63 @@ export function syncTransportUsable() {
 export async function asyncFetchRange(url, start, end) {
   const response = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
   if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+  if (response.status !== 206) {
+    // Do not materialize a potentially enormous response merely to discover
+    // that the host ignored Range. The caller will perform one intentional
+    // whole-file fallback instead.
+    await response.body?.cancel();
+    throw new RangeUnsupported(url);
+  }
+  const contentRange = response.headers.get("Content-Range") || "";
+  if (!validContentRange(contentRange, start, end)) {
+    await response.body?.cancel();
+    throw new RangeUnsupported(url);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const returned = parseContentRange(contentRange);
+  if (!returned || bytes.length !== returned.end - returned.start + 1) {
+    throw new RangeUnsupported(url);
+  }
   return {
-    bytes: new Uint8Array(await response.arrayBuffer()),
+    bytes,
     status: response.status,
     etag: response.headers.get("ETag") || "",
-    contentRange: response.headers.get("Content-Range") || "",
+    contentRange,
   };
 }
 
 /** Synchronous ranged GET. Only valid inside a Worker, and not on WebKit. */
 export function xhrTransport(url, start, end) {
-  const request = new XMLHttpRequest();
-  request.open("GET", url, false);
-  request.responseType = "arraybuffer";
-  request.setRequestHeader("Range", `bytes=${start}-${end}`);
-  request.send(null);
-  if (request.status !== 206 && request.status !== 200) {
+  let request;
+  try {
+    request = new XMLHttpRequest();
+    request.open("GET", url, false);
+    request.responseType = "arraybuffer";
+    request.setRequestHeader("Range", `bytes=${start}-${end}`);
+    request.send(null);
+  } catch {
+    // Some engines allow responseType to be assigned during the capability
+    // probe but reject the actual synchronous request.
+    throw new RangeUnsupported(url);
+  }
+  if (request.status !== 206) {
+    if (request.status === 200) throw new RangeUnsupported(url);
     throw new Error(`HTTP ${request.status} for ${url}`);
   }
+  const contentRange = request.getResponseHeader("Content-Range") || "";
+  if (!validContentRange(contentRange, start, end)) {
+    throw new RangeUnsupported(url);
+  }
+  const bytes = new Uint8Array(request.response);
+  const returned = parseContentRange(contentRange);
+  if (!returned || bytes.length !== returned.end - returned.start + 1) {
+    throw new RangeUnsupported(url);
+  }
   return {
-    bytes: new Uint8Array(request.response),
+    bytes,
     status: request.status,
     etag: request.getResponseHeader("ETag") || "",
-    contentRange: request.getResponseHeader("Content-Range") || "",
+    contentRange,
   };
 }
 
@@ -106,9 +140,28 @@ function mergeSpans(spans) {
   return merged;
 }
 
+function parseContentRange(contentRange) {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec((contentRange || "").trim());
+  if (!match) return null;
+  const parsed = {
+    start: Number(match[1]),
+    end: Number(match[2]),
+    total: Number(match[3]),
+  };
+  return parsed.start <= parsed.end && parsed.end < parsed.total ? parsed : null;
+}
+
+function validContentRange(contentRange, requestedStart, requestedEnd) {
+  const parsed = parseContentRange(contentRange);
+  return Boolean(
+    parsed &&
+      parsed.start === requestedStart &&
+      parsed.end <= requestedEnd,
+  );
+}
+
 function parseTotalSize(contentRange) {
-  const match = /^bytes \d+-\d+\/(\d+)$/.exec((contentRange || "").trim());
-  return match ? Number(match[1]) : null;
+  return parseContentRange(contentRange)?.total ?? null;
 }
 
 /**
@@ -219,14 +272,10 @@ class RemoteFile {
 
     const payload = result.bytes;
     let payloadStart = start;
-    if (result.status === 200) {
-      // The server ignored Range and sent the whole file. Still usable.
-      this.size = payload.length;
-      payloadStart = 0;
-    } else {
-      const total = parseTotalSize(result.contentRange);
-      if (total !== null) this.size = total;
-    }
+    if (result.status !== 206) throw new RangeUnsupported(this.url);
+    const total = parseTotalSize(result.contentRange);
+    if (total === null) throw new RangeUnsupported(this.url);
+    this.size = total;
 
     for (let offset = 0; offset + payloadStart < payloadStart + payload.length; offset += this.blockSize) {
       if ((payloadStart + offset) % this.blockSize !== 0) break;
@@ -281,13 +330,10 @@ class RemoteFile {
     }
     let payload = result.bytes;
     let payloadStart = start;
-    if (result.status === 200) {
-      this.size = payload.length;
-      payloadStart = 0;
-    } else {
-      const total = parseTotalSize(result.contentRange);
-      if (total !== null) this.size = total;
-    }
+    if (result.status !== 206) throw new RangeUnsupported(this.url);
+    const total = parseTotalSize(result.contentRange);
+    if (total === null) throw new RangeUnsupported(this.url);
+    this.size = total;
     for (let offset = 0; offset < payload.length; offset += this.blockSize) {
       if ((payloadStart + offset) % this.blockSize !== 0) break;
       const slice = payload.subarray(offset, offset + this.blockSize);
@@ -523,9 +569,10 @@ function remoteOpener(sqlite3, vfsName) {
       blockSize: options.blockSize || state.blockSize,
       cacheBytes: options.cacheBytes || state.cacheBytes,
     });
-    // Without a synchronous transport the size must be known up front, since
-    // xOpen cannot await.
-    if (!transport) await file.openAsync();
+    // Probe asynchronously even when synchronous XHR is available. If a host
+    // ignores Range, fetch() lets us cancel the body before a multi-hundred-MB
+    // response is allocated; the synchronous transport cannot.
+    await file.openAsync();
     state.registry.set(handle, file);
     let db;
     try {

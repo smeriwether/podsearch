@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "python3 -m podsearch --config config.toml build-site",
-    "test": "python3 -m unittest discover -s tests",
+    "test": "python3 -m unittest discover -s tests && npm run test:vfs",
+    "test:vfs": "node --test tests/http-vfs.test.mjs",
     "verify:site": "node scripts/verify-site.mjs"
   },
   "dependencies": {

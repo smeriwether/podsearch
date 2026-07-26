@@ -7,7 +7,19 @@ import tempfile
 import unittest
 
 from podsearch import storage
-from podsearch.site import SCHEMA_VERSION, _build_public_databases, fold_search_text
+from podsearch.config import (
+    AppConfig,
+    ChartConfig,
+    Config,
+    SiteConfig,
+    TranscriptionConfig,
+)
+from podsearch.site import (
+    SCHEMA_VERSION,
+    _build_public_databases,
+    build_site,
+    fold_search_text,
+)
 
 
 NOW = "2026-07-25T00:00:00+00:00"
@@ -46,6 +58,9 @@ def _connect_source() -> sqlite3.Connection:
         """,
         (show_id, NOW, NOW, show_id, NOW, NOW),
     )
+    # Mirror production writes, where the storage migration and
+    # set_transcript() persist a content fingerprint.
+    storage.migrate(source)
     source.commit()
     return source
 
@@ -69,6 +84,43 @@ def _query(path: pathlib.Path, sql: str, params: tuple = ()):
 
 
 class PublicDatabaseTests(unittest.TestCase):
+    def test_worker_builds_are_deferred_and_a_forced_build_clears_pending(self) -> None:
+        source = _connect_source()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repository = pathlib.Path(__file__).resolve().parents[1]
+            config = Config(
+                root=repository,
+                app=AppConfig(
+                    database_path=root / "source.sqlite3",
+                    public_dir=root / "public",
+                    state_dir=root / "var",
+                ),
+                chart=ChartConfig(),
+                transcription=TranscriptionConfig(),
+                site=SiteConfig(),
+                favorites=(),
+                feed_overrides={},
+            )
+            build_site(config, source)
+            manifest = config.app.public_dir / "data" / "manifest.json"
+            stamp = manifest.stat().st_mtime_ns
+
+            deferred = build_site(
+                config,
+                source,
+                minimum_interval_seconds=900,
+            )
+            self.assertEqual(deferred["site_build_deferred"], 1)
+            self.assertEqual(manifest.stat().st_mtime_ns, stamp)
+            self.assertTrue((config.app.state_dir / "run" / "site-build.pending").is_file())
+
+            build_site(config, source)
+            self.assertFalse(
+                (config.app.state_dir / "run" / "site-build.pending").exists()
+            )
+        source.close()
+
     def test_catalog_excludes_bulk_columns_and_indexes_snippets(self) -> None:
         source = _connect_source()
         with tempfile.TemporaryDirectory() as directory:
@@ -237,10 +289,14 @@ class PublicDatabaseTests(unittest.TestCase):
             details = root / "data" / "details.sqlite3"
             details_stamp = details.stat().st_mtime_ns
 
-            source.execute(
-                "UPDATE episodes SET status = 'transcribed',"
-                " transcript_text = 'Another transcript entirely.',"
-                " updated_at = '2026-07-26T00:00:00+00:00' WHERE guid = 'new'"
+            episode_id = source.execute(
+                "SELECT id FROM episodes WHERE guid = 'new'"
+            ).fetchone()["id"]
+            storage.set_transcript(
+                source,
+                int(episode_id),
+                transcript="Another transcript entirely.",
+                path=root / "new.txt",
             )
             source.commit()
             stats = _build(source, root)
@@ -262,9 +318,14 @@ class PublicDatabaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             _build(source, root)
-            source.execute(
-                "UPDATE episodes SET transcript_text = 'Replacement wording here.',"
-                " updated_at = '2026-07-27T00:00:00+00:00' WHERE guid = 'done'"
+            episode_id = source.execute(
+                "SELECT id FROM episodes WHERE guid = 'done'"
+            ).fetchone()["id"]
+            storage.set_transcript(
+                source,
+                int(episode_id),
+                transcript="Replacement wording here.",
+                path=root / "replacement.txt",
             )
             source.commit()
             _build(source, root)
@@ -293,6 +354,56 @@ class PublicDatabaseTests(unittest.TestCase):
             self.assertEqual(
                 _query(shard, "SELECT COUNT(*) FROM transcripts")[0][0], 1
             )
+        source.close()
+
+    def test_routine_feed_refresh_does_not_rebuild_transcript_indexes(self) -> None:
+        source = _connect_source()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _build(source, root)
+            search = root / "data" / "search.sqlite3"
+            shard = root / "data" / "transcripts" / "2026-07.sqlite3"
+            stamps = (search.stat().st_mtime_ns, shard.stat().st_mtime_ns)
+
+            source.execute(
+                """
+                UPDATE episodes
+                SET updated_at = '2026-07-29T00:00:00+00:00'
+                WHERE guid = 'done'
+                """
+            )
+            source.commit()
+            stats = _build(source, root)
+
+            self.assertEqual(stats["rebuilt_databases"], 0)
+            self.assertEqual(
+                stamps,
+                (search.stat().st_mtime_ns, shard.stat().st_mtime_ns),
+            )
+        source.close()
+
+    def test_show_name_change_refreshes_transcript_indexes(self) -> None:
+        source = _connect_source()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _build(source, root)
+            source.execute("UPDATE shows SET name = 'Renamed Program'")
+            source.commit()
+            _build(source, root)
+
+            for path in (
+                root / "data" / "search.sqlite3",
+                root / "data" / "transcripts" / "2026-07.sqlite3",
+            ):
+                self.assertEqual(
+                    _query(
+                        path,
+                        "SELECT COUNT(*) FROM transcript_search"
+                        " WHERE transcript_search MATCH 'renamed'",
+                    )[0][0],
+                    1,
+                    path.name,
+                )
         source.close()
 
     def test_removed_transcript_disappears_from_every_index(self) -> None:

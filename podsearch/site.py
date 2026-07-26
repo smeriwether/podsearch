@@ -8,6 +8,7 @@ import os
 import pathlib
 import shutil
 import sqlite3
+import time
 import unicodedata
 from collections import defaultdict
 from typing import Callable, Iterable, Iterator
@@ -44,14 +45,34 @@ ROUTES = ("podcasts", "favorites", "podcast", "episode", "episodes", "search")
 LEGACY_DATA_NAMES = ("podsearch.sqlite3", "podsearch.sqlite3.gz")
 
 
-def build_site(config: Config, conn: sqlite3.Connection) -> dict[str, int]:
+def build_site(
+    config: Config,
+    conn: sqlite3.Connection,
+    *,
+    minimum_interval_seconds: int = 0,
+) -> dict[str, int]:
     run_dir = config.app.state_dir / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
     lock_path = run_dir / "site-build.lock"
+    pending_path = run_dir / "site-build.pending"
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            return _build_site_unlocked(config, conn)
+            if minimum_interval_seconds > 0:
+                pending_path.touch()
+                manifest_path = config.app.public_dir / "data" / MANIFEST_NAME
+                if manifest_path.is_file():
+                    age = max(0.0, time.time() - manifest_path.stat().st_mtime)
+                    if age < minimum_interval_seconds:
+                        return {
+                            "site_build_deferred": 1,
+                            "site_build_wait_seconds": max(
+                                1, int(minimum_interval_seconds - age)
+                            ),
+                        }
+            stats = _build_site_unlocked(config, conn)
+            pending_path.unlink(missing_ok=True)
+            return stats
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -283,8 +304,8 @@ def _public_episode_index(source: sqlite3.Connection) -> list[sqlite3.Row]:
 def _transcript_index(source: sqlite3.Connection) -> list[sqlite3.Row]:
     return source.execute(
         """
-        SELECT episodes.id, episodes.published_at, episodes.updated_at,
-               length(episodes.transcript_text) AS transcript_length
+        SELECT episodes.id, episodes.published_at, episodes.transcript_sha256,
+               episodes.title, shows.name AS show_name
         FROM episodes
         JOIN shows ON shows.id = episodes.show_id
         WHERE shows.active = 1 AND (shows.ever_top_100 = 1 OR shows.favorite = 1)
@@ -703,7 +724,11 @@ def _sync_search_index(
     generated_at: str,
 ) -> dict:
     desired = {
-        int(row["id"]): _digest(str(row["updated_at"]), str(row["transcript_length"]))
+        int(row["id"]): _digest(
+            str(row["transcript_sha256"]),
+            str(row["title"]),
+            str(row["show_name"]),
+        )
         for row in transcripts
     }
     version = _version("search", sorted(desired.items()))
@@ -798,7 +823,11 @@ def _sync_shard(
     generated_at: str,
 ) -> dict:
     desired = {
-        int(row["id"]): _digest(str(row["updated_at"]), str(row["transcript_length"]))
+        int(row["id"]): _digest(
+            str(row["transcript_sha256"]),
+            str(row["title"]),
+            str(row["show_name"]),
+        )
         for row in rows
     }
     version = _version(f"shard:{key}", sorted(desired.items()))

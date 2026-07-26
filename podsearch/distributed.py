@@ -68,6 +68,7 @@ def export_worker_snapshot(
             """
             UPDATE episodes
             SET transcript_text = NULL,
+                transcript_sha256 = NULL,
                 transcript_path = NULL,
                 error_message = NULL
             """

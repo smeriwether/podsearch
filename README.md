@@ -78,11 +78,17 @@ exclusive access handles and a worker survives in the back/forward cache, OPFS
 is used purely as storage: the catalog bytes are read out and the pool is
 released immediately, leaving it free for the next page.
 
-Every published database is rebuilt incrementally and swapped in atomically. A
-build that changes nothing rewrites nothing, and a backfill pass that completes
-one episode touches only that episode's rows. If a file is republished while a
-browser is reading it, the VFS notices the changed `ETag`, re-reads the
-manifest, and retries against the new revision rather than mixing two files.
+Every published database is rebuilt incrementally and swapped in atomically.
+Transcript fingerprints use the transcript SHA-256 plus its indexed title and
+show name, so an RSS refresh timestamp does not rebuild an unchanged FTS index.
+The active backfill workers coalesce publication to at most once every 15
+minutes (`PODSEARCH_SITE_BUILD_INTERVAL_SECONDS`) rather than copying and
+compressing the growing global index after every episode. A final forced build
+still runs when a worker drains its queue.
+
+If a file is republished while a browser is reading it, the VFS notices the
+changed `ETag`, re-reads the manifest, and retries against the new revision
+rather than mixing two files.
 
 ## Current data rules
 
@@ -191,7 +197,8 @@ Instead:
 4. Each completion becomes a checksummed JSON bundle in
    `var/worker-outbox/`.
 5. The mini pulls bundles over SSH/rsync, imports only transcripts it still
-   lacks, clears their leases, and rebuilds the static site.
+   lacks, clears their leases, and joins the shared 15-minute site-build
+   schedule.
 
 Expired leases automatically return to the mini queue. Bundle imports are
 idempotent, so even a race or retry cannot corrupt the primary database.
@@ -307,8 +314,10 @@ byte-range serving works.
 
 The site needs a static host that supports HTTP range requests (`Accept-Ranges:
 bytes` and `206 Partial Content`). The bundled server does, and Cloudflare
-passes ranges through. Without range support the VFS falls back to fetching
-whole databases, which works but gives up the main benefit.
+passes ranges through. The VFS requires a valid `Content-Range` and cancels an
+ignored asynchronous range response before its body is buffered. A confirmed
+lack of range support falls back once to a whole database; transient network
+errors do not permanently disable ranged reads.
 
 Range responses are always served from the identity file — a gzip stream cannot
 be seeked into — so each published database keeps a `.gz` sibling that is used

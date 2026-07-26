@@ -3,6 +3,7 @@ import {
   installHttpVfs,
   RemoteFileChanged,
   NeedsPrefetch,
+  RangeUnsupported,
 } from "/http-vfs.js?v=__ASSET_VERSION__";
 
 const MANIFEST_URL = "/data/manifest.json";
@@ -275,8 +276,10 @@ async function remote(url) {
     try {
       return trackRemote(url, await openRemote(url), MAX_OPEN_REMOTE);
     } catch (error) {
-      // Ranged reading is unavailable altogether (no range support at all, or
-      // the file could not be opened). Fall back to whole downloads.
+      // Only a confirmed capability failure disables ranges. A transient
+      // network or publication error must not turn every later query into a
+      // whole-database download.
+      if (!(error instanceof RangeUnsupported)) throw error;
       rangeReadsUsable = false;
       rangeFailure = error;
     }
@@ -334,6 +337,11 @@ async function withRemote(urlFor, run) {
       closeRemote(url);
       if (attempt === 0 && cause instanceof RemoteFileChanged) {
         manifest = await fetchManifest();
+        continue;
+      }
+      if (attempt === 0 && cause instanceof RangeUnsupported) {
+        rangeReadsUsable = false;
+        rangeFailure = cause;
         continue;
       }
       throw cause;

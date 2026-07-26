@@ -6,7 +6,13 @@ cd "$SCRIPT_DIR/.."
 export PYTHONDONTWRITEBYTECODE=1
 
 BATCH_SIZE=${PODSEARCH_BACKFILL_BATCH_SIZE:-2}
+SITE_BUILD_INTERVAL=${PODSEARCH_SITE_BUILD_INTERVAL_SECONDS:-900}
 mkdir -p var/logs var/run
+
+if ! [[ "$SITE_BUILD_INTERVAL" == <-> && "$SITE_BUILD_INTERVAL" -gt 0 ]]; then
+  echo "PODSEARCH_SITE_BUILD_INTERVAL_SECONDS must be a positive integer" >&2
+  exit 1
+fi
 
 LOCK_DIR="var/run/backfill.lock"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -48,7 +54,8 @@ while true; do
   if [ "${QUEUED:-0}" -eq 0 ]; then
     break
   fi
-  python3 -m podsearch --config config.toml build-site
+  python3 -m podsearch --config config.toml build-site \
+    --if-stale-seconds "$SITE_BUILD_INTERVAL"
 done
 
 python3 -m podsearch --config config.toml build-site
