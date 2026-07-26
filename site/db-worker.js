@@ -1,5 +1,9 @@
 import sqlite3InitModule from "/vendor/sqlite/index.mjs";
-import { installHttpVfs, RemoteFileChanged } from "/http-vfs.js?v=__ASSET_VERSION__";
+import {
+  installHttpVfs,
+  RemoteFileChanged,
+  NeedsPrefetch,
+} from "/http-vfs.js?v=__ASSET_VERSION__";
 
 const MANIFEST_URL = "/data/manifest.json";
 const OPFS_VFS_NAME = "podsearch-opfs";
@@ -10,6 +14,10 @@ const EXPECTED_SCHEMA = 7;
 const MAX_OPEN_REMOTE = 4;
 const OPFS_ATTEMPTS = 3;
 const OPFS_RETRY_MS = 200;
+// A faulted query replays once per round of prefetching. A b-tree descent plus
+// FTS segment reads settle well inside this; the cap only stops a pathological
+// loop.
+const MAX_PREFETCH_ROUNDS = 24;
 
 let sqlite3;
 let catalogDb;
@@ -256,7 +264,7 @@ async function resumeOpfs() {
 // Remote databases
 // --------------------------------------------------------------------------
 
-function remote(url) {
+async function remote(url) {
   const cached = remoteDatabases.get(url);
   if (cached) {
     remoteDatabases.delete(url);
@@ -265,11 +273,10 @@ function remote(url) {
   }
   if (rangeReadsUsable) {
     try {
-      return trackRemote(url, openRemote(url), MAX_OPEN_REMOTE);
+      return trackRemote(url, await openRemote(url), MAX_OPEN_REMOTE);
     } catch (error) {
-      // Reading pages over HTTP needs a synchronous XHR, which SQLite's
-      // synchronous xRead leaves no way around. If a browser refuses it, stop
-      // trying and download whole databases instead: much slower, but working.
+      // Ranged reading is unavailable altogether (no range support at all, or
+      // the file could not be opened). Fall back to whole downloads.
       rangeReadsUsable = false;
       rangeFailure = error;
     }
@@ -319,9 +326,9 @@ function closeRemote(url) {
 async function withRemote(urlFor, run) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const url = urlFor();
-    const db = remote(url) || (await remoteWholeFile(url));
+    const db = (await remote(url)) || (await remoteWholeFile(url));
     try {
-      return run(db);
+      return await replayUntilResolved(db, run);
     } catch (error) {
       const cause = db.takeRemoteError?.() || error;
       closeRemote(url);
@@ -333,6 +340,30 @@ async function withRemote(urlFor, run) {
     }
   }
   throw new Error("The archive changed while it was being read. Please try again.");
+}
+
+/**
+ * Run a query, satisfying page faults as they happen.
+ *
+ * SQLite's xRead is synchronous, and WebKit refuses a synchronous XHR that
+ * returns binary data even inside a Worker, so Safari and every iOS browser
+ * cannot fetch a page mid-query. Instead the read faults, records the byte
+ * range it wanted, and the query is replayed once the range has been fetched
+ * asynchronously. The queries here are read-only SELECTs, so replaying is
+ * free of side effects, and each round leaves more of the file cached until
+ * the query completes.
+ */
+async function replayUntilResolved(db, run) {
+  for (let round = 0; round < MAX_PREFETCH_ROUNDS; round += 1) {
+    try {
+      return run(db);
+    } catch (error) {
+      const cause = db.takeRemoteError?.() || error;
+      if (!(cause instanceof NeedsPrefetch)) throw cause;
+      if (!db.prefetchPending || !(await db.prefetchPending())) throw cause;
+    }
+  }
+  throw new Error("Reading the archive took too many round trips.");
 }
 
 const detailsUrl = () => manifest.details.path;

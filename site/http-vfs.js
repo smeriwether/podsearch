@@ -26,6 +26,18 @@ export class RemoteFileChanged extends Error {
   }
 }
 
+/**
+ * Raised inside xRead when a needed block is not cached and the environment
+ * cannot fetch it synchronously. The caller prefetches and re-runs the query.
+ */
+export class NeedsPrefetch extends Error {
+  constructor(url) {
+    super(`Remote database needs more data: ${url}`);
+    this.name = "NeedsPrefetch";
+    this.url = url;
+  }
+}
+
 export class RangeUnsupported extends Error {
   constructor(url) {
     super(`Server did not honour a range request for ${url}`);
@@ -34,7 +46,36 @@ export class RangeUnsupported extends Error {
   }
 }
 
-/** Synchronous ranged GET. Only valid inside a Worker. */
+/**
+ * Whether this engine allows a synchronous XHR to return binary data.
+ *
+ * The spec permits it in a Worker, but WebKit throws InvalidAccessError
+ * regardless, so Safari and every iOS browser take the asynchronous path.
+ */
+export function syncTransportUsable() {
+  try {
+    const request = new XMLHttpRequest();
+    request.open("GET", self.location?.href || "/", false);
+    request.responseType = "arraybuffer";
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Asynchronous ranged GET, usable everywhere. */
+export async function asyncFetchRange(url, start, end) {
+  const response = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    status: response.status,
+    etag: response.headers.get("ETag") || "",
+    contentRange: response.headers.get("Content-Range") || "",
+  };
+}
+
+/** Synchronous ranged GET. Only valid inside a Worker, and not on WebKit. */
 export function xhrTransport(url, start, end) {
   const request = new XMLHttpRequest();
   request.open("GET", url, false);
@@ -52,6 +93,19 @@ export function xhrTransport(url, start, end) {
   };
 }
 
+/** Merge overlapping or touching byte spans so each becomes one request. */
+function mergeSpans(spans) {
+  if (!spans.length) return [];
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  const merged = [sorted[0].slice()];
+  for (const [start, end] of sorted.slice(1)) {
+    const last = merged[merged.length - 1];
+    if (start <= last[1] + 1) last[1] = Math.max(last[1], end);
+    else merged.push([start, end]);
+  }
+  return merged;
+}
+
 function parseTotalSize(contentRange) {
   const match = /^bytes \d+-\d+\/(\d+)$/.exec((contentRange || "").trim());
   return match ? Number(match[1]) : null;
@@ -62,9 +116,11 @@ function parseTotalSize(contentRange) {
  * the file being republished underneath an open read.
  */
 class RemoteFile {
-  constructor(url, { transport, blockSize, cacheBytes }) {
+  constructor(url, { transport, asyncFetch, blockSize, cacheBytes }) {
     this.url = url;
+    // transport is null when the engine refuses synchronous binary XHR.
     this.transport = transport;
+    this.asyncFetch = asyncFetch || asyncFetchRange;
     this.blockSize = blockSize;
     this.maxBlocks = Math.max(8, Math.floor(cacheBytes / blockSize));
     this.blocks = new Map();
@@ -77,6 +133,8 @@ class RemoteFile {
     // adjacency and ramp a readahead window up while access stays sequential.
     this.nextSequentialBlock = -1;
     this.readAhead = 1;
+    // Ranges a faulted read asked for but could not fetch synchronously.
+    this.pending = [];
   }
 
   open() {
@@ -127,6 +185,12 @@ class RemoteFile {
   }
 
   fetchRun(firstBlock, blockCount) {
+    if (!this.transport) {
+      // No synchronous transport: note what was wanted and let the caller
+      // prefetch it, then replay the query.
+      this.want(firstBlock, blockCount);
+      throw new NeedsPrefetch(this.url);
+    }
     if (firstBlock === this.nextSequentialBlock) {
       this.readAhead = Math.min(this.readAhead * 2, MAX_READAHEAD_BLOCKS);
     } else {
@@ -174,6 +238,73 @@ class RemoteFile {
     this.evict();
   }
 
+  /** Record a wanted span, growing it by the current readahead window. */
+  want(firstBlock, blockCount) {
+    const readAhead = firstBlock === this.nextSequentialBlock
+      ? Math.min(this.readAhead * 2, MAX_READAHEAD_BLOCKS)
+      : 1;
+    this.readAhead = readAhead;
+    const start = firstBlock * this.blockSize;
+    let end = start + (blockCount + readAhead - 1) * this.blockSize - 1;
+    if (this.size !== null) end = Math.min(end, this.size - 1);
+    if (end < start) return;
+    this.nextSequentialBlock = Math.floor(end / this.blockSize) + 1;
+    this.pending.push([start, end]);
+  }
+
+  /**
+   * Fetch everything a faulted query asked for. Returns whether anything was
+   * retrieved, so the caller can stop replaying when no progress is possible.
+   */
+  async prefetch() {
+    const spans = mergeSpans(this.pending);
+    this.pending = [];
+    if (!spans.length) return false;
+    const results = await Promise.all(
+      spans.map(([start, end]) => this.asyncFetch(this.url, start, end)),
+    );
+    for (let index = 0; index < spans.length; index += 1) {
+      this.absorb(results[index], spans[index][0]);
+    }
+    return true;
+  }
+
+  absorb(result, start) {
+    this.requestCount += 1;
+    this.bytesFetched += result.bytes.length;
+    if (this.etag === null) {
+      this.etag = result.etag || "";
+    } else if (result.etag && result.etag !== this.etag) {
+      this.blocks.clear();
+      this.etag = result.etag;
+      throw new RemoteFileChanged(this.url);
+    }
+    let payload = result.bytes;
+    let payloadStart = start;
+    if (result.status === 200) {
+      this.size = payload.length;
+      payloadStart = 0;
+    } else {
+      const total = parseTotalSize(result.contentRange);
+      if (total !== null) this.size = total;
+    }
+    for (let offset = 0; offset < payload.length; offset += this.blockSize) {
+      if ((payloadStart + offset) % this.blockSize !== 0) break;
+      const slice = payload.subarray(offset, offset + this.blockSize);
+      if (!slice.length) break;
+      this.blocks.set((payloadStart + offset) / this.blockSize, slice);
+    }
+    this.evict();
+  }
+
+  /** Learn the file size before SQLite ever opens it. */
+  async openAsync() {
+    const result = await this.asyncFetch(this.url, 0, this.blockSize - 1);
+    this.absorb(result, 0);
+    if (this.size === null) throw new RangeUnsupported(this.url);
+    return this;
+  }
+
   evict() {
     while (this.blocks.size > this.maxBlocks) {
       const oldest = this.blocks.keys().next().value;
@@ -195,7 +326,13 @@ export function installHttpVfs(sqlite3, options = {}) {
 
   const blockSize = options.blockSize || DEFAULT_BLOCK_SIZE;
   const cacheBytes = options.cacheBytes || DEFAULT_CACHE_BYTES;
-  const transport = options.transport || xhrTransport;
+  const transport =
+    options.transport !== undefined
+      ? options.transport
+      : syncTransportUsable()
+        ? xhrTransport
+        : null;
+  const asyncFetch = options.asyncFetch || asyncFetchRange;
 
   const registry = new Map();
   const openFiles = new Map();
@@ -358,6 +495,7 @@ export function installHttpVfs(sqlite3, options = {}) {
     blockSize,
     cacheBytes,
     transport,
+    asyncFetch,
     nextHandle: () => `remote-${handleCounter++}`,
     takeError: () => {
       const error = pendingError;
@@ -375,13 +513,19 @@ function remoteOpener(sqlite3, vfsName) {
    * Open a remote database. The URL is registered under an opaque handle so a
    * `?v=` cache-busting query is never mistaken for SQLite URI parameters.
    */
-  return function openRemote(url, options = {}) {
+  return async function openRemote(url, options = {}) {
     const handle = state.nextHandle();
+    const transport =
+      options.transport !== undefined ? options.transport : state.transport;
     const file = new RemoteFile(url, {
-      transport: options.transport || state.transport,
+      transport,
+      asyncFetch: options.asyncFetch || state.asyncFetch,
       blockSize: options.blockSize || state.blockSize,
       cacheBytes: options.cacheBytes || state.cacheBytes,
     });
+    // Without a synchronous transport the size must be known up front, since
+    // xOpen cannot await.
+    if (!transport) await file.openAsync();
     state.registry.set(handle, file);
     let db;
     try {
@@ -405,6 +549,8 @@ function remoteOpener(sqlite3, vfsName) {
       size: file.size,
     });
     db.takeRemoteError = state.takeError;
+    db.prefetchPending = () => file.prefetch();
+    db.usesSyncTransport = Boolean(transport);
     return db;
   };
 }
