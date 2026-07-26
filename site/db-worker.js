@@ -18,6 +18,10 @@ let openRemote;
 let opfsPool = null;
 let catalogSource = "network";
 let opfsPaused = false;
+// Ranged reads need a synchronous XHR; if a browser refuses one we fall back
+// to downloading whole databases and stop retrying.
+let rangeReadsUsable = true;
+let rangeFailure = null;
 const remoteDatabases = new Map();
 
 let activeSearchToken = 0;
@@ -259,10 +263,38 @@ function remote(url) {
     remoteDatabases.set(url, cached);
     return cached;
   }
-  const db = openRemote(url);
+  if (rangeReadsUsable) {
+    try {
+      return trackRemote(url, openRemote(url), MAX_OPEN_REMOTE);
+    } catch (error) {
+      // Reading pages over HTTP needs a synchronous XHR, which SQLite's
+      // synchronous xRead leaves no way around. If a browser refuses it, stop
+      // trying and download whole databases instead: much slower, but working.
+      rangeReadsUsable = false;
+      rangeFailure = error;
+    }
+  }
+  return null;
+}
+
+/** Whole-database fallback for browsers that cannot do ranged reads. */
+async function remoteWholeFile(url) {
+  const cached = remoteDatabases.get(url);
+  if (cached) return cached;
+  const response = await fetch(url, { cache: "force-cache" });
+  if (!response.ok) {
+    throw new Error(`Archive download failed with HTTP ${response.status}`);
+  }
+  const bytes = await readWithProgress(response, 0);
+  // These files are large, so only one is kept resident at a time.
+  return trackRemote(url, deserializeDatabase(bytes), 1);
+}
+
+function trackRemote(url, db, limit) {
   remoteDatabases.set(url, db);
-  while (remoteDatabases.size > MAX_OPEN_REMOTE) {
+  while (remoteDatabases.size > limit) {
     const oldest = remoteDatabases.keys().next().value;
+    if (oldest === url) break;
     closeRemote(oldest);
   }
   return db;
@@ -287,7 +319,7 @@ function closeRemote(url) {
 async function withRemote(urlFor, run) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const url = urlFor();
-    const db = remote(url);
+    const db = remote(url) || (await remoteWholeFile(url));
     try {
       return run(db);
     } catch (error) {
