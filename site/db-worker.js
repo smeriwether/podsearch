@@ -1,12 +1,25 @@
 import sqlite3InitModule from "/vendor/sqlite/index.mjs";
+import { installHttpVfs, RemoteFileChanged } from "/http-vfs.js?v=__ASSET_VERSION__";
 
-const CATALOG_URL = "/data/catalog.sqlite3";
-const DATABASE_CACHE = "podsearch-database-v9";
-const DATABASE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MANIFEST_URL = "/data/manifest.json";
+const OPFS_VFS_NAME = "podsearch-opfs";
+const CATALOG_FILE = "/catalog.sqlite3";
+const EXPECTED_SCHEMA = 7;
+// Only the catalog is downloaded. Everything else is read page by page over
+// HTTP ranges, so these stay open to keep their block caches warm.
+const MAX_OPEN_REMOTE = 4;
+const OPFS_ATTEMPTS = 3;
+const OPFS_RETRY_MS = 200;
 
 let sqlite3;
 let catalogDb;
-let transcriptShards = [];
+let manifest;
+let openRemote;
+let opfsPool = null;
+let catalogSource = "network";
+let opfsPaused = false;
+const remoteDatabases = new Map();
+
 let activeSearchToken = 0;
 let activeSearchRequestId = null;
 
@@ -14,23 +27,28 @@ const post = (type, payload = {}) => self.postMessage({ type, ...payload });
 
 class SearchCancelled extends Error {}
 
-async function initialize() {
-  await deleteLegacyDatabaseCaches();
-  sqlite3 = await sqlite3InitModule();
-  const { bytes, source } = await loadDatabaseBytes(CATALOG_URL, {
-    phase: "catalog",
-  });
-  catalogDb = deserializeDatabase(bytes);
+// --------------------------------------------------------------------------
+// Startup
+// --------------------------------------------------------------------------
 
-  const metaRows = selectObjects(catalogDb, "SELECT key, value FROM meta");
-  const meta = Object.fromEntries(metaRows.map(({ key, value }) => [key, value]));
-  transcriptShards = selectObjects(
-    catalogDb,
-    `
-      SELECT key, path, episode_count, database_bytes, compressed_bytes
-      FROM transcript_shards
-      ORDER BY key DESC
-    `,
+async function initialize() {
+  sqlite3 = await sqlite3InitModule({ print: () => {}, printErr: () => {} });
+  openRemote = installHttpVfs(sqlite3);
+  manifest = await fetchManifest();
+  if (manifest.schema_version !== EXPECTED_SCHEMA) {
+    throw new Error(
+      `This page is out of date (archive format ${manifest.schema_version}). Reload to continue.`,
+    );
+  }
+
+  opfsPool = await openOpfsPool();
+  catalogDb = await openCatalog();
+
+  const meta = Object.fromEntries(
+    selectObjects(catalogDb, "SELECT key, value FROM meta").map(({ key, value }) => [
+      key,
+      value,
+    ]),
   );
   const shows = selectObjects(
     catalogDb,
@@ -42,82 +60,137 @@ async function initialize() {
                 WHERE show_id = shows.id AND has_transcript = 1) AS transcript_count
       FROM shows
       ORDER BY
-        apple_rank IS NULL,
-        apple_rank,
-        favorite_order IS NULL,
-        favorite_order,
-        chart_rank IS NULL,
-        chart_rank,
+        apple_rank IS NULL, apple_rank,
+        favorite_order IS NULL, favorite_order,
+        chart_rank IS NULL, chart_rank,
         id
     `,
   );
   post("ready", {
     meta,
     shows,
-    bytes: bytes.byteLength,
-    source,
-    shardCount: transcriptShards.length,
+    source: catalogSource,
+    bytes: manifest.catalog.bytes,
+    shardCount: manifest.shards.length,
   });
 }
 
-async function deleteLegacyDatabaseCaches() {
-  try {
-    const cacheNames = await caches.keys();
-    await Promise.all(
-      cacheNames
-        .filter(
-          (name) =>
-            name.startsWith("podsearch-database-") && name !== DATABASE_CACHE,
-        )
-        .map((name) => caches.delete(name)),
-    );
-  } catch {
-    // Cache Storage is an optimization; database loading still works without it.
-  }
-}
-
-async function loadDatabaseBytes(url, progress = {}) {
-  let cache;
-  try {
-    cache = await caches.open(DATABASE_CACHE);
-    const cached = await cache.match(url);
-    const cachedAt = Number(cached?.headers.get("x-podsearch-cached-at") || 0);
-    if (cached && Date.now() - cachedAt < DATABASE_CACHE_TTL_MS) {
-      return {
-        bytes: new Uint8Array(await cached.arrayBuffer()),
-        source: "cache",
-      };
-    }
-  } catch {
-    cache = null;
-  }
-
-  const response = await fetch(url, { cache: "no-cache" });
+async function fetchManifest() {
+  const response = await fetch(MANIFEST_URL, { cache: "no-store" });
   if (!response.ok) {
-    throw new Error(`Database download failed with HTTP ${response.status}`);
+    throw new Error(`Could not load the archive index (HTTP ${response.status})`);
   }
-  const bytes = await readResponse(response, progress);
-  if (cache) {
-    const headers = new Headers({
-      "content-type": "application/vnd.sqlite3",
-      "x-podsearch-cached-at": String(Date.now()),
-    });
-    await cache.put(url, new Response(bytes, { headers })).catch(() => {});
-  }
-  return { bytes, source: "network" };
+  return response.json();
 }
 
-async function readResponse(response, progress) {
+async function openOpfsPool() {
+  // The pool takes exclusive sync access handles, so following a link can
+  // briefly race the previous page's worker, which has not released them yet.
+  // A couple of short retries turn that transient loss into a cache hit
+  // instead of a needless multi-megabyte download.
+  for (let attempt = 0; attempt < OPFS_ATTEMPTS; attempt += 1) {
+    try {
+      // opfs-sahpool is deliberate: the plain OPFS VFS needs cross-origin
+      // isolation, which would require COEP headers that break the podcast
+      // artwork loaded from Apple's CDN.
+      const pool = await sqlite3.installOpfsSAHPoolVfs({
+        name: OPFS_VFS_NAME,
+        forceReinitIfPreviouslyFailed: attempt > 0,
+      });
+      await pool.reserveMinimumCapacity(4);
+      return pool;
+    } catch {
+      if (attempt < OPFS_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, OPFS_RETRY_MS));
+      }
+    }
+  }
+  // Private windows and browsers without OPFS land here and simply pay the
+  // download on every visit.
+  return null;
+}
+
+/**
+ * Open the catalog, reusing the copy already in OPFS when the manifest says it
+ * is current. A repeat visit then costs one small manifest request instead of
+ * a multi-megabyte download.
+ */
+async function openCatalog() {
+  const bytes = (await catalogBytesFromOpfs()) || (await downloadAndStoreCatalog());
+  return deserializeDatabase(bytes);
+}
+
+/** Return the stored catalog if OPFS holds the revision the manifest names. */
+async function catalogBytesFromOpfs() {
+  if (!opfsPool || !opfsPool.getFileNames().includes(CATALOG_FILE)) return null;
+  let db;
+  try {
+    db = new sqlite3.oo1.DB({ filename: CATALOG_FILE, vfs: opfsPool.vfsName });
+    const stored = selectObjects(db, "SELECT value FROM meta WHERE key = 'version'")[0];
+    db.close();
+    db = null;
+    if (stored?.value !== manifest.catalog.version) {
+      opfsPool.unlink(CATALOG_FILE);
+      return null;
+    }
+    const bytes = opfsPool.exportFile(CATALOG_FILE);
+    catalogSource = "opfs";
+    return bytes;
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+    releaseOpfs();
+  }
+}
+
+async function downloadAndStoreCatalog() {
+  const bytes = await downloadCatalog();
+  catalogSource = "network";
+  if (opfsPool) {
+    try {
+      opfsPool.importDb(CATALOG_FILE, bytes);
+    } catch {
+      // Storing is an optimisation; the download already succeeded.
+    }
+    releaseOpfs();
+  }
+  return bytes;
+}
+
+async function downloadCatalog() {
+  const response = await fetch(manifest.catalog.path, { cache: "no-cache" });
+  if (!response.ok) {
+    throw new Error(`Catalog download failed with HTTP ${response.status}`);
+  }
+  return readWithProgress(response, manifest.catalog.bytes);
+}
+
+async function readWithProgress(response, expectedBytes) {
   if (!response.body) return new Uint8Array(await response.arrayBuffer());
   const reader = response.body.getReader();
   const chunks = [];
   let received = 0;
+  let lastPosted = 0;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
     received += value.byteLength;
-    post("progress", { ...progress, received });
+    // The wire carries gzip, so `received` runs ahead of the compressed size;
+    // clamp so the reported fraction never exceeds one.
+    if (received - lastPosted > 65536) {
+      lastPosted = received;
+      post("loading", {
+        received,
+        total: expectedBytes,
+        ratio: expectedBytes ? Math.min(1, received / expectedBytes) : 0,
+      });
+    }
   }
   const bytes = new Uint8Array(received);
   let offset = 0;
@@ -132,17 +205,115 @@ function deserializeDatabase(bytes) {
   const pointer = sqlite3.wasm.allocFromTypedArray(bytes);
   const database = new sqlite3.oo1.DB();
   database.onclose = { after: () => sqlite3.wasm.dealloc(pointer) };
-  const rc = sqlite3.capi.sqlite3_deserialize(
-    database.pointer,
-    "main",
-    pointer,
-    bytes.byteLength,
-    bytes.byteLength,
-    0,
+  database.checkRc(
+    sqlite3.capi.sqlite3_deserialize(
+      database.pointer,
+      "main",
+      pointer,
+      bytes.byteLength,
+      bytes.byteLength,
+      0,
+    ),
   );
-  database.checkRc(rc);
   return database;
 }
+
+/**
+ * Give the OPFS pool back as soon as startup is done.
+ *
+ * opfs-sahpool takes exclusive sync access handles for as long as it is
+ * installed, and a dedicated worker survives in the back/forward cache. Holding
+ * the pool for the worker's lifetime therefore locked out the next same-origin
+ * page, which then re-downloaded the catalog. This is a multi-page site, so the
+ * pool is used only as durable storage: read the bytes, hand it straight back,
+ * and run the catalog from memory.
+ */
+function releaseOpfs() {
+  if (!opfsPool || opfsPaused) return;
+  try {
+    opfsPool.pauseVfs();
+    opfsPaused = true;
+  } catch {
+    // Something still holds a file; the next page falls back to the network.
+  }
+}
+
+async function resumeOpfs() {
+  if (!opfsPool || !opfsPaused) return;
+  try {
+    await opfsPool.unpauseVfs();
+    opfsPaused = false;
+  } catch {
+    opfsPool = null;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Remote databases
+// --------------------------------------------------------------------------
+
+function remote(url) {
+  const cached = remoteDatabases.get(url);
+  if (cached) {
+    remoteDatabases.delete(url);
+    remoteDatabases.set(url, cached);
+    return cached;
+  }
+  const db = openRemote(url);
+  remoteDatabases.set(url, db);
+  while (remoteDatabases.size > MAX_OPEN_REMOTE) {
+    const oldest = remoteDatabases.keys().next().value;
+    closeRemote(oldest);
+  }
+  return db;
+}
+
+function closeRemote(url) {
+  const db = remoteDatabases.get(url);
+  remoteDatabases.delete(url);
+  try {
+    db?.close();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Run a query against a remote database, tolerating the file being republished
+ * mid-read. The backfill rebuilds these files constantly, so a read that spans
+ * a swap has to be retried against the new revision rather than surfacing a
+ * corruption error.
+ */
+async function withRemote(urlFor, run) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const url = urlFor();
+    const db = remote(url);
+    try {
+      return run(db);
+    } catch (error) {
+      const cause = db.takeRemoteError?.() || error;
+      closeRemote(url);
+      if (attempt === 0 && cause instanceof RemoteFileChanged) {
+        manifest = await fetchManifest();
+        continue;
+      }
+      throw cause;
+    }
+  }
+  throw new Error("The archive changed while it was being read. Please try again.");
+}
+
+const detailsUrl = () => manifest.details.path;
+const searchUrl = () => manifest.search.path;
+const shardUrl = (key) => {
+  const shard = manifest.shards.find((entry) => entry.key === key);
+  if (!shard) throw new Error(`Transcript archive ${key} is unavailable`);
+  return shard.path;
+};
+
+// --------------------------------------------------------------------------
+// Query helpers
+// --------------------------------------------------------------------------
 
 function selectObjects(database, sql, bind = []) {
   const resultRows = [];
@@ -151,33 +322,43 @@ function selectObjects(database, sql, bind = []) {
 }
 
 function searchTerms(input) {
-  return input
+  return input.normalize("NFKC").match(/[\p{L}\p{N}][\p{L}\p{N}'’-]*/gu) || [];
+}
+
+/** Mirrors fold_search_text() in site.py so LIKE comparisons are symmetric. */
+function foldSearchText(value) {
+  return String(value ?? "")
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
     .normalize("NFKC")
-    .match(/[\p{L}\p{N}][\p{L}\p{N}'’-]*/gu);
+    .toLowerCase();
 }
 
 function ftsQuery(input) {
   const terms = searchTerms(input);
-  if (!terms?.length) return "";
+  if (!terms.length) return "";
   return terms
     .slice(0, 12)
     .map((term) => `"${term.replaceAll('"', '""')}"*`)
     .join(" AND ");
 }
 
+// --------------------------------------------------------------------------
+// Catalog queries
+// --------------------------------------------------------------------------
+
+const EPISODE_COLUMNS = `
+  e.id, e.title, e.published_at, e.duration, e.has_transcript, e.has_detail,
+  e.transcript_shard, s.id AS show_id, s.name AS show_name, s.artwork_url,
+  s.chart_rank, s.apple_rank, s.in_top_100, s.favorite, s.favorite_order
+`;
+
 function latestTranscripts({ limit = 30, offset = 0 }) {
   return selectObjects(
     catalogDb,
     `
-      SELECT e.id, e.title, e.published_at, e.duration, e.status,
-             e.has_transcript,
-             s.id AS show_id, s.name AS show_name, s.artwork_url,
-             s.chart_rank, s.apple_rank, s.in_top_100, s.favorite,
-             s.favorite_order,
-             COALESCE(
-               NULLIF(substr(e.description, 1, 280), ''),
-               'Open the full transcript.'
-             ) AS snippet,
+      SELECT ${EPISODE_COLUMNS},
+             COALESCE(NULLIF(e.snippet, ''), 'Open the full transcript.') AS snippet,
              0 AS score
       FROM episodes e
       JOIN shows s ON s.id = e.show_id
@@ -189,171 +370,6 @@ function latestTranscripts({ limit = 30, offset = 0 }) {
   );
 }
 
-function searchShows(normalized, terms) {
-  const showText = `
-    lower(
-      name || ' ' ||
-      COALESCE(artist, '') || ' ' ||
-      COALESCE(description, '')
-    )
-  `;
-  const showWhere = terms.map(() => `${showText} LIKE ?`).join(" AND ");
-  return selectObjects(
-    catalogDb,
-    `
-      SELECT id, name, artist, description, artwork_url, chart_rank, apple_rank,
-             in_top_100, ever_top_100, favorite, favorite_order,
-             (SELECT COUNT(*) FROM episodes WHERE show_id = shows.id) AS episode_count,
-             (SELECT COUNT(*) FROM episodes
-                WHERE show_id = shows.id AND has_transcript = 1) AS transcript_count
-      FROM shows
-      WHERE ${showWhere}
-      ORDER BY in_top_100 DESC, chart_rank IS NULL, chart_rank, name
-      LIMIT 24
-    `,
-    terms.map((term) => `%${term.toLocaleLowerCase()}%`),
-  );
-}
-
-function searchEpisodeMetadata(match, limit) {
-  return selectObjects(
-    catalogDb,
-    `
-      SELECT e.id,
-             COALESCE(
-               NULLIF(snippet(episode_search, 2, '<mark>', '</mark>', ' … ', 30), ''),
-               substr(e.description, 1, 280),
-               'Episode information'
-             ) AS snippet,
-             bm25(episode_search, 8.0, 4.0, 1.0) AS score
-      FROM episode_search
-      JOIN episodes e ON e.id = episode_search.rowid
-      WHERE episode_search MATCH ?
-      ORDER BY score, e.published_at DESC
-      LIMIT ?
-    `,
-    [match, Number(limit)],
-  );
-}
-
-async function searchTranscriptText(match, limit, requestId, searchToken) {
-  const candidates = [];
-  for (let index = 0; index < transcriptShards.length; index += 1) {
-    if (searchToken !== activeSearchToken) throw new SearchCancelled();
-    const shard = transcriptShards[index];
-    post("search-progress", {
-      requestId,
-      completed: index,
-      total: transcriptShards.length,
-      shard: shard.key,
-    });
-    const { bytes } = await loadDatabaseBytes(shard.path, {
-      requestId,
-      phase: "search",
-      shard: shard.key,
-      completed: index,
-      total: transcriptShards.length,
-    });
-    if (searchToken !== activeSearchToken) throw new SearchCancelled();
-    const database = deserializeDatabase(bytes);
-    try {
-      candidates.push(
-        ...selectObjects(
-          database,
-          `
-            SELECT transcripts.episode_id AS id,
-                   snippet(transcript_search, 2, '<mark>', '</mark>', ' … ', 30)
-                     AS snippet,
-                   bm25(transcript_search, 8.0, 4.0, 1.0) AS score
-            FROM transcript_search
-            JOIN transcripts
-              ON transcripts.episode_id = transcript_search.rowid
-            WHERE transcript_search MATCH ?
-            ORDER BY score
-            LIMIT ?
-          `,
-          [match, Number(limit)],
-        ),
-      );
-    } finally {
-      database.close();
-    }
-    post("search-progress", {
-      requestId,
-      completed: index + 1,
-      total: transcriptShards.length,
-      shard: shard.key,
-    });
-  }
-  return candidates;
-}
-
-function enrichEpisodeCandidates(candidates, limit) {
-  const bestByEpisode = new Map();
-  for (const candidate of candidates) {
-    const existing = bestByEpisode.get(candidate.id);
-    if (!existing || Number(candidate.score) < Number(existing.score)) {
-      bestByEpisode.set(candidate.id, candidate);
-    }
-  }
-  const selected = [...bestByEpisode.values()]
-    .sort((left, right) => Number(left.score) - Number(right.score))
-    .slice(0, Number(limit));
-  if (!selected.length) return [];
-
-  const placeholders = selected.map(() => "?").join(",");
-  const details = selectObjects(
-    catalogDb,
-    `
-      SELECT e.id, e.title, e.published_at, e.duration, e.status,
-             e.has_transcript,
-             s.id AS show_id, s.name AS show_name, s.artwork_url,
-             s.chart_rank, s.apple_rank, s.in_top_100, s.favorite,
-             s.favorite_order
-      FROM episodes e
-      JOIN shows s ON s.id = e.show_id
-      WHERE e.id IN (${placeholders})
-    `,
-    selected.map(({ id }) => Number(id)),
-  );
-  const detailsById = new Map(details.map((row) => [row.id, row]));
-  return selected
-    .map((candidate) => ({
-      ...detailsById.get(candidate.id),
-      snippet: candidate.snippet,
-      score: candidate.score,
-    }))
-    .filter((row) => row.id)
-    .sort(
-      (left, right) =>
-        Number(left.score) - Number(right.score) ||
-        String(right.published_at || "").localeCompare(String(left.published_at || "")),
-    );
-}
-
-async function globalSearch({ query = "", limit = 80, requestId }, searchToken) {
-  const normalized = query.trim();
-  const match = ftsQuery(normalized);
-  if (!match) return { shows: [], episodes: [] };
-  const terms = searchTerms(normalized).slice(0, 12);
-  const shows = searchShows(normalized, terms);
-  const metadataCandidates = searchEpisodeMetadata(match, limit);
-  const transcriptCandidates = await searchTranscriptText(
-    match,
-    limit,
-    requestId,
-    searchToken,
-  );
-  if (searchToken !== activeSearchToken) throw new SearchCancelled();
-  return {
-    shows,
-    episodes: enrichEpisodeCandidates(
-      [...metadataCandidates, ...transcriptCandidates],
-      limit,
-    ),
-  };
-}
-
 function episodesPage({ page = 1, perPage = 50 }) {
   const safePerPage = Math.min(50, Math.max(1, Number(perPage) || 50));
   const total = Number(
@@ -361,27 +377,19 @@ function episodesPage({ page = 1, perPage = 50 }) {
   );
   const totalPages = Math.max(1, Math.ceil(total / safePerPage));
   const safePage = Math.min(totalPages, Math.max(1, Number(page) || 1));
-  const offset = (safePage - 1) * safePerPage;
   const rows = selectObjects(
     catalogDb,
     `
-      SELECT e.id, e.title, e.published_at, e.duration, e.status,
-             e.has_transcript,
-             s.id AS show_id, s.name AS show_name, s.artwork_url,
-             s.chart_rank, s.apple_rank, s.in_top_100, s.favorite,
-             s.favorite_order,
-             COALESCE(
-               NULLIF(substr(e.description, 1, 280), ''),
-               'Open episode details.'
-             ) AS snippet
+      SELECT ${EPISODE_COLUMNS},
+             COALESCE(NULLIF(e.snippet, ''), 'Open episode details.') AS snippet
       FROM episodes e
       JOIN shows s ON s.id = e.show_id
       ORDER BY e.published_at IS NULL, e.published_at DESC, e.id DESC
       LIMIT ? OFFSET ?
     `,
-    [safePerPage, offset],
+    [safePerPage, (safePage - 1) * safePerPage],
   );
-  return { rows, total, page: safePage, totalPages };
+  return { rows, total, page: safePage, totalPages, perPage: safePerPage };
 }
 
 function show(id) {
@@ -401,8 +409,7 @@ function show(id) {
   details.episodes = selectObjects(
     catalogDb,
     `
-      SELECT id, title, description, episode_url, image_url, published_at,
-             duration, status, has_transcript
+      SELECT id, title, snippet, published_at, duration, has_transcript
       FROM episodes
       WHERE show_id = ?
       ORDER BY published_at DESC, id DESC
@@ -411,6 +418,187 @@ function show(id) {
   );
   return details;
 }
+
+function searchShows(terms) {
+  if (!terms.length) return [];
+  const where = terms.map(() => "search_text LIKE ? ESCAPE '\\'").join(" AND ");
+  return selectObjects(
+    catalogDb,
+    `
+      SELECT id, name, artist, description, artwork_url, chart_rank, apple_rank,
+             in_top_100, ever_top_100, favorite, favorite_order,
+             (SELECT COUNT(*) FROM episodes WHERE show_id = shows.id) AS episode_count,
+             (SELECT COUNT(*) FROM episodes
+                WHERE show_id = shows.id AND has_transcript = 1) AS transcript_count
+      FROM shows
+      WHERE ${where}
+      ORDER BY in_top_100 DESC, chart_rank IS NULL, chart_rank, name
+      LIMIT 24
+    `,
+    terms.map((term) => `%${escapeLike(foldSearchText(term))}%`),
+  );
+}
+
+function escapeLike(value) {
+  return value.replace(/[\\%_]/g, (character) => `\\${character}`);
+}
+
+function searchEpisodeMetadata(match, limit) {
+  return selectObjects(
+    catalogDb,
+    `
+      SELECT episode_search.rowid AS id,
+             snippet(episode_search, 2, char(1), char(2), ' … ', 30) AS snippet,
+             bm25(episode_search, 8.0, 4.0, 1.0) AS score
+      FROM episode_search
+      WHERE episode_search MATCH ?
+      ORDER BY score
+      LIMIT ?
+    `,
+    [match, Number(limit)],
+  );
+}
+
+// --------------------------------------------------------------------------
+// Search
+// --------------------------------------------------------------------------
+
+/**
+ * One descent into the global contentless index replaces the old fan-out that
+ * downloaded every monthly shard.
+ */
+function searchTranscripts(match, limit) {
+  return withRemote(searchUrl, (db) =>
+    selectObjects(
+      db,
+      `
+        SELECT rowid AS id, bm25(transcript_search, 8.0, 4.0, 1.0) AS score
+        FROM transcript_search
+        WHERE transcript_search MATCH ?
+        ORDER BY score
+        LIMIT ?
+      `,
+      [match, Number(limit)],
+    ),
+  );
+}
+
+/**
+ * Snippets come from the monthly shards, but only for the handful of results
+ * actually being rendered.
+ */
+async function snippetsForHits(hits, match, requestId, searchToken) {
+  const byShard = new Map();
+  for (const hit of hits) {
+    if (!hit.transcript_shard) continue;
+    if (!byShard.has(hit.transcript_shard)) byShard.set(hit.transcript_shard, []);
+    byShard.get(hit.transcript_shard).push(Number(hit.id));
+  }
+  const snippets = new Map();
+  let completed = 0;
+  for (const [key, ids] of byShard) {
+    if (searchToken !== activeSearchToken) throw new SearchCancelled();
+    post("search-progress", {
+      requestId,
+      completed,
+      total: byShard.size,
+      shard: key,
+    });
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = await withRemote(
+      () => shardUrl(key),
+      (db) =>
+        selectObjects(
+          db,
+          `
+            SELECT rowid AS id,
+                   snippet(transcript_search, 2, char(1), char(2), ' … ', 30) AS snippet
+            FROM transcript_search
+            WHERE transcript_search MATCH ? AND rowid IN (${placeholders})
+          `,
+          [match, ...ids],
+        ),
+    );
+    for (const row of rows) snippets.set(Number(row.id), row.snippet);
+    completed += 1;
+    post("search-progress", {
+      requestId,
+      completed,
+      total: byShard.size,
+      shard: key,
+    });
+  }
+  return snippets;
+}
+
+function episodeDetailsFor(ids) {
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = selectObjects(
+    catalogDb,
+    `
+      SELECT ${EPISODE_COLUMNS}, e.snippet AS fallback_snippet
+      FROM episodes e
+      JOIN shows s ON s.id = e.show_id
+      WHERE e.id IN (${placeholders})
+    `,
+    ids.map(Number),
+  );
+  return new Map(rows.map((row) => [row.id, row]));
+}
+
+async function globalSearch({ query = "", limit = 80, requestId }, searchToken) {
+  const match = ftsQuery(query.trim());
+  if (!match) return { shows: [], episodes: [] };
+
+  const shows = searchShows(searchTerms(query.trim()).slice(0, 12));
+  const metadataHits = searchEpisodeMetadata(match, limit);
+  const transcriptHits = await searchTranscripts(match, limit);
+  if (searchToken !== activeSearchToken) throw new SearchCancelled();
+
+  const best = new Map();
+  for (const hit of [...metadataHits, ...transcriptHits]) {
+    const id = Number(hit.id);
+    const existing = best.get(id);
+    if (!existing || Number(hit.score) < Number(existing.score)) {
+      best.set(id, { id, score: Number(hit.score), snippet: hit.snippet || null });
+    }
+  }
+  const ranked = [...best.values()]
+    .sort((left, right) => left.score - right.score)
+    .slice(0, Number(limit));
+  if (!ranked.length) return { shows, episodes: [] };
+
+  const details = episodeDetailsFor(ranked.map((hit) => hit.id));
+  const withShards = ranked
+    .map((hit) => ({ ...hit, ...details.get(hit.id) }))
+    .filter((row) => row.id !== undefined);
+
+  // Only transcript hits that lack a metadata snippet need shard access.
+  const needSnippets = withShards.filter((row) => !row.snippet && row.has_transcript);
+  const snippets = await snippetsForHits(needSnippets, match, requestId, searchToken);
+  if (searchToken !== activeSearchToken) throw new SearchCancelled();
+
+  const episodes = withShards
+    .map((row) => ({
+      ...row,
+      snippet:
+        row.snippet ||
+        snippets.get(Number(row.id)) ||
+        row.fallback_snippet ||
+        "Open this result.",
+    }))
+    .sort(
+      (left, right) =>
+        left.score - right.score ||
+        String(right.published_at || "").localeCompare(String(left.published_at || "")),
+    );
+  return { shows, episodes };
+}
+
+// --------------------------------------------------------------------------
+// Episode page
+// --------------------------------------------------------------------------
 
 async function episode(id, requestId) {
   const details = selectObjects(
@@ -425,34 +613,40 @@ async function episode(id, requestId) {
     `,
     [Number(id)],
   )[0];
-  if (!details || !details.has_transcript || !details.transcript_shard) {
-    return details;
+  if (!details) return null;
+
+  if (details.has_detail) {
+    post("episode-progress", { requestId, stage: "details" });
+    const rows = await withRemote(detailsUrl, (db) =>
+      selectObjects(
+        db,
+        "SELECT description, episode_url, image_url FROM details WHERE episode_id = ?",
+        [Number(id)],
+      ),
+    );
+    Object.assign(details, rows[0] || {});
   }
 
-  const shard = transcriptShards.find(({ key }) => key === details.transcript_shard);
-  if (!shard) {
-    throw new Error(`Transcript shard ${details.transcript_shard} is unavailable`);
-  }
-  post("episode-progress", { requestId, shard: shard.key });
-  const { bytes } = await loadDatabaseBytes(shard.path, {
-    requestId,
-    phase: "episode",
-    shard: shard.key,
-  });
-  const database = deserializeDatabase(bytes);
-  try {
-    const transcript = selectObjects(
-      database,
-      "SELECT transcript_text FROM transcripts WHERE episode_id = ?",
-      [Number(id)],
-    )[0];
-    if (!transcript) throw new Error("Transcript is missing from its archive shard");
-    details.transcript_text = transcript.transcript_text;
-  } finally {
-    database.close();
+  if (details.has_transcript && details.transcript_shard) {
+    post("episode-progress", { requestId, stage: "transcript" });
+    const rows = await withRemote(
+      () => shardUrl(details.transcript_shard),
+      (db) =>
+        selectObjects(
+          db,
+          "SELECT transcript_text FROM transcripts WHERE episode_id = ?",
+          [Number(id)],
+        ),
+    );
+    if (!rows.length) throw new Error("Transcript is missing from its archive shard");
+    details.transcript_text = rows[0].transcript_text;
   }
   return details;
 }
+
+// --------------------------------------------------------------------------
+// Message loop
+// --------------------------------------------------------------------------
 
 self.onmessage = async ({ data }) => {
   try {

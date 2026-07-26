@@ -6,12 +6,12 @@ reads episode RSS feeds, downloads audio temporarily, transcribes it with
 Whisper.cpp and Metal, and exports a static SQLite catalog plus monthly
 transcript databases with FTS5 search indexes.
 
-The public site downloads the small compressed catalog first and opens it with
-SQLite Wasm in a Web Worker. Transcript searches open one monthly shard at a
-time and close it before opening the next; episode pages fetch only the month
-containing that transcript. Search queries and full-transcript reads stay in
-the visitor's browser, and downloaded databases are cached for 6 hours. The
-Mac mini serves only static files.
+The public site downloads one small compressed catalog and opens it with SQLite
+Wasm in a Web Worker. Everything else — full episode descriptions, the global
+transcript search index, and the monthly transcript shards — is read in place
+over HTTP range requests, so a query costs pages rather than files. Search
+queries and full-transcript reads stay in the visitor's browser. The Mac mini
+serves only static files.
 
 Live site: <https://podsearch.merimerimeri.com>
 
@@ -29,26 +29,60 @@ Apple Top 100 JSON + iTunes Lookup API
          whisper-cli + Metal
                  |
                  v
- public/data/catalog.sqlite3.gz
- public/data/transcripts/YYYY-MM.sqlite3.gz
+ public/data/manifest.json          (tiny, never cached)
+ public/data/catalog.sqlite3.gz     (downloaded whole, then kept in OPFS)
+ public/data/details.sqlite3        (range-read)
+ public/data/search.sqlite3         (range-read)
+ public/data/transcripts/YYYY-MM.sqlite3  (range-read)
                  |
-       localhost static server
+       localhost static server (byte ranges, HTTP/1.1 keep-alive)
                  |
          Cloudflare Tunnel
                  |
                  v
- Browser Web Worker + SQLite Wasm + FTS5
+ Browser Web Worker + SQLite Wasm + FTS5 + HTTP-range VFS
 ```
 
-The catalog contains podcast metadata, every indexed episode, transcript
-availability, and a metadata FTS index. Monthly shards contain only completed
-transcripts and their transcript FTS indexes. The public files exclude audio
-URLs, failure records, local paths, and chart history.
+Only the catalog is downloaded. It holds podcast metadata, one row per episode
+with a truncated snippet, transcript availability, and a metadata FTS index —
+deliberately not full descriptions, per-episode URLs, or transcripts, because
+every byte in it is paid for on the first visit by every visitor.
 
-This keeps initial navigation lightweight and bounds browser memory to the
-catalog plus the largest monthly shard instead of loading the entire archive
-into memory. A full-archive search may download every shard once, but processes
-them serially and reuses the browser cache on later searches.
+The other three databases are opened through a read-only SQLite VFS that
+fetches 32 KiB blocks over HTTP range requests, with sequential readahead and a
+block cache:
+
+- `details.sqlite3` — full descriptions and per-episode links. An episode page
+  reads one row: a couple of requests, tens of kilobytes, out of a file tens of
+  megabytes large.
+- `search.sqlite3` — a single contentless FTS5 index over every transcript. A
+  search is one b-tree descent instead of a fan-out across shards.
+- `transcripts/YYYY-MM.sqlite3` — full text plus a snippet-capable index. Only
+  the shards holding results are touched, and only for the rows displayed.
+
+The result is that search and episode cost scales with the size of the answer
+rather than the size of the archive. Downloading every shard to run one search
+does not scale: at full 2026 coverage that would be on the order of a gigabyte.
+
+The public files exclude audio URLs, failure records, local paths, chart
+history, and the per-row fingerprints used to drive incremental builds (those
+live in `var/site-state/`).
+
+### Freshness
+
+`manifest.json` is served `no-store` and names the current version of every
+database. The worker fetches it on each page load, and reuses the catalog
+already stored in OPFS when the versions match — so a repeat visit costs about
+a kilobyte instead of a multi-megabyte download. Because the pool takes
+exclusive access handles and a worker survives in the back/forward cache, OPFS
+is used purely as storage: the catalog bytes are read out and the pool is
+released immediately, leaving it free for the next page.
+
+Every published database is rebuilt incrementally and swapped in atomically. A
+build that changes nothing rewrites nothing, and a backfill pass that completes
+one episode touches only that episode's rows. If a file is republished while a
+browser is reading it, the VFS notices the changed `ETag`, re-reads the
+manifest, and retries against the new revision rather than mixing two files.
 
 ## Current data rules
 
@@ -262,9 +296,23 @@ python3 -m compileall -q podsearch tests
 npm run verify:site
 ```
 
-The browser smoke test covers database download progress, FTS search,
-highlighted results, full-transcript display, copy-to-clipboard, source links,
-and the mobile breakpoint.
+`npm run verify:site` inspects the built artifacts rather than the source text:
+it checks that every manifest entry resolves to a file of the declared size and
+version, that the catalog still excludes the bulky columns, that `has_detail`
+and `has_transcript` agree with the details and transcript databases, that the
+FTS indexes answer real queries and produce highlighted snippets, and that
+byte-range serving works.
+
+## Hosting requirements
+
+The site needs a static host that supports HTTP range requests (`Accept-Ranges:
+bytes` and `206 Partial Content`). The bundled server does, and Cloudflare
+passes ranges through. Without range support the VFS falls back to fetching
+whole databases, which works but gives up the main benefit.
+
+Range responses are always served from the identity file — a gzip stream cannot
+be seeked into — so each published database keeps a `.gz` sibling that is used
+only for whole-file requests.
 
 ## Coverage caveats
 

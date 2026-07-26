@@ -13,9 +13,12 @@ const state = {
 renderInitialRoute();
 document.addEventListener("keydown", focusSearch);
 
-const worker = new Worker("/db-worker.js?v=20260725z", { type: "module" });
+const worker = new Worker("/db-worker.js?v=__ASSET_VERSION__", { type: "module" });
 worker.onmessage = ({ data }) => {
-  if (data.type === "progress") return;
+  if (data.type === "loading") {
+    showCatalogProgress(data);
+    return;
+  }
   if (["search-progress", "episode-progress"].includes(data.type)) {
     state.pending.get(data.requestId)?.progress?.(data);
     return;
@@ -52,6 +55,21 @@ worker.onmessage = ({ data }) => {
   }
 };
 
+/**
+ * Surface catalog download progress. The worker reports it on every visit
+ * where the archive is not already in OPFS, and it used to be discarded.
+ */
+function showCatalogProgress({ ratio }) {
+  const percent = Math.round((ratio || 0) * 100);
+  for (const node of document.querySelectorAll("[data-loading-label]")) {
+    node.textContent = percent > 0 ? `Loading the archive… ${percent}%` : "Loading the archive…";
+  }
+  for (const bar of document.querySelectorAll("[data-loading-bar]")) {
+    bar.style.setProperty("--progress", `${percent}%`);
+    bar.setAttribute("aria-valuenow", String(percent));
+  }
+}
+
 function request(type, payload = {}, progress = null) {
   const requestId = ++state.requestId;
   return new Promise((resolve, reject) => {
@@ -69,10 +87,20 @@ function renderInitialRoute() {
   } else {
     app.innerHTML = `
       <section class="loading-page" aria-live="polite">
-        <span class="loader"></span><p>Opening the archive…</p>
+        <span class="loader"></span>
+        <p data-loading-label>Opening the archive…</p>
+        ${progressBar()}
       </section>
     `;
   }
+}
+
+function progressBar() {
+  return `
+    <span class="progress-track" data-loading-bar role="progressbar"
+          aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+          aria-label="Archive download progress"></span>
+  `;
 }
 
 async function renderRoute() {
@@ -119,7 +147,7 @@ function renderHomeShell(ready) {
       </div>
       ${ready
         ? `<p class="result-meta" id="result-count">Loading transcripts…</p><div class="results" id="results"></div>`
-        : `<p class="archive-loading" aria-live="polite"><span class="loader"></span> Loading the latest transcripts…</p>`}
+        : `<p class="archive-loading" aria-live="polite"><span class="loader"></span> <span data-loading-label>Loading the archive…</span></p>${progressBar()}`}
     </section>
   `;
   bindHomeSearch();
@@ -263,12 +291,12 @@ async function renderAllEpisodesPage() {
     page: requestedPage,
     perPage: 50,
   });
-  const { rows, total, page, totalPages } = result;
+  const { rows, total, page, totalPages, perPage } = result;
   if (page !== requestedPage) {
     window.history.replaceState({}, "", page > 1 ? `/episodes/?page=${page}` : "/episodes/");
   }
   document.title = `${page > 1 ? `Page ${page} — ` : ""}All Episodes — Podsearch`;
-  const first = total ? ((page - 1) * 50) + 1 : 0;
+  const first = total ? ((page - 1) * perPage) + 1 : 0;
   const last = total ? first + rows.length - 1 : 0;
   app.innerHTML = `
     <section class="episodes-page">
@@ -457,14 +485,17 @@ function episodeRow(episode) {
 async function renderEpisodePage() {
   const id = new URLSearchParams(window.location.search).get("id");
   if (!id) return renderNotFound("Episode not found");
-  const episode = await request("episode", { id }, () => {
-    const loadingText = document.querySelector(".loading-page p");
-    if (loadingText) loadingText.textContent = "Loading this transcript…";
+  const episode = await request("episode", { id }, ({ stage }) => {
+    const loadingText = document.querySelector("[data-loading-label]");
+    if (loadingText) {
+      loadingText.textContent =
+        stage === "transcript" ? "Loading this transcript…" : "Loading this episode…";
+    }
   });
   if (!episode) return renderNotFound("Episode not found");
   document.title = `${episode.title} — Podsearch`;
   const source = episode.episode_url || episode.apple_url;
-  const hasTranscript = episode.status === "transcribed" && episode.transcript_text;
+  const hasTranscript = Boolean(episode.has_transcript && episode.transcript_text);
   const transcriptionActive = Boolean(episode.in_top_100 || episode.favorite);
   const copyTranscript = hasTranscript ? sentenceLines(episode.transcript_text).join("\n") : "";
   app.innerHTML = `
@@ -571,10 +602,15 @@ function artwork(url, name, className) {
     : `<span class="${className} artwork-placeholder" aria-hidden="true">${escapeHtml((name || "P").slice(0, 1))}</span>`;
 }
 
+/**
+ * FTS5 marks matches with U+0001/U+0002 rather than literal <mark> tags, so a
+ * transcript that happens to contain the text "<mark>" cannot smuggle markup
+ * through the un-escaping step.
+ */
 function safeSnippet(value) {
   return escapeHtml(value || "Open this result.")
-    .replaceAll("&lt;mark&gt;", "<mark>")
-    .replaceAll("&lt;/mark&gt;", "</mark>");
+    .replaceAll("\u0001", "<mark>")
+    .replaceAll("\u0002", "</mark>");
 }
 
 function safeUrl(value) {

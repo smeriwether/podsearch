@@ -678,3 +678,27 @@ footer p { margin: 0; }
   .header-nav { margin-left: auto; }
   .podcast-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+.progress-track {
+  display: block;
+  width: min(24rem, 100%);
+  height: 4px;
+  margin: 0.9rem 0 0;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+.progress-track::after {
+  content: "";
+  display: block;
+  height: 100%;
+  width: var(--progress, 0%);
+  border-radius: inherit;
+  background: currentColor;
+  transition: width 0.2s ease-out;
+}
+
+.loading-page .progress-track {
+  margin-inline: auto;
+}
