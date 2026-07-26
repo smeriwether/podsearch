@@ -32,7 +32,14 @@ ROW_BATCH = 200
 # published file once its freelist grows past this share of the database.
 VACUUM_FREELIST_RATIO = 0.2
 
-STATIC_ASSETS = ("index.html", "styles.css", "app.js", "db-worker.js", "http-vfs.js")
+STATIC_ASSETS = (
+    "index.html",
+    "styles.css",
+    "app.js",
+    "db-worker.js",
+    "http-vfs.js",
+    "favicon.svg",
+)
 ROUTES = ("podcasts", "favorites", "podcast", "episode", "episodes", "search")
 LEGACY_DATA_NAMES = ("podsearch.sqlite3", "podsearch.sqlite3.gz")
 

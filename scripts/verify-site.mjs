@@ -66,6 +66,7 @@ const required = [
   "app.js",
   "db-worker.js",
   "http-vfs.js",
+  "favicon.svg",
   "vendor/sqlite/index.mjs",
   "vendor/sqlite/sqlite3.wasm",
   "podcasts/index.html",
@@ -79,6 +80,8 @@ for (const name of required) {
   const path = join(publicDir, name);
   check(`asset present: ${name}`, (await isFile(path)) && (await size(path)) > 0);
 }
+const indexHtml = await readFile(join(publicDir, "index.html"), "utf8");
+check("favicon linked from page", indexHtml.includes('rel="icon" href="/favicon.svg?v='));
 
 // --- manifest ------------------------------------------------------------
 
